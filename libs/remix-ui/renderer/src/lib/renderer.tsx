@@ -33,7 +33,9 @@ export const Renderer = ({ message, opt = {}, editor, config, fileManager, plugi
   const [editorOptions, setEditorOptions] = useState({
     useSpan: false,
     type: '',
-    errFile: ''
+    errFile: '',
+    errLine: -1,
+    errCol: -1
   })
   const [classList] = useState(opt.type === 'error' ? 'alert alert-danger' : 'alert alert-warning')
   const [close, setClose] = useState(false)
@@ -113,14 +115,32 @@ export const Renderer = ({ message, opt = {}, editor, config, fileManager, plugi
     setClose(true)
   }
 
+  const handleExplain = (e) => {
+    // Don't trigger the row's error-jump click handler.
+    e.stopPropagation()
+    if (!plugin) return
+    plugin.call('aiPanel', 'explainError', {
+      message: messageText,
+      file: editorOptions.errFile,
+      line: editorOptions.errLine >= 0 ? editorOptions.errLine + 1 : undefined
+    }).catch((err) => {
+      // AI panel may not be activated yet; surface, never hang.
+      console.error('aiPanel.explainError failed:', err)
+    })
+  }
+
   const _errorClick = (errFile, errLine, errCol) => {
     if (errFile !== config.get('currentFile')) {
       // TODO: refactor with this._components.contextView.jumpTo
       const provider = fileManager.fileProviderOf(errFile)
       if (provider) {
-        provider.exists(errFile).then(() => {
-          fileManager.open(errFile)
-          editor.gotoLine(errLine, errCol)
+        // Only jump to a file that actually exists — an unresolved import (e.g.
+        // a removed @openzeppelin/…/Counters.sol) has no local file, so opening
+        // it throws. RETURN the open() promise so its rejection is caught here
+        // instead of surfacing as an uncaught runtime error (dev-overlay crash).
+        provider.exists(errFile).then((exist) => {
+          if (!exist) return
+          return Promise.resolve(fileManager.open(errFile)).then(() => editor.gotoLine(errLine, errCol))
         }).catch(error => {
           if (error) return console.log(error)
         })
@@ -136,6 +156,9 @@ export const Renderer = ({ message, opt = {}, editor, config, fileManager, plugi
         messageText && !close && (
           <div className={`sol ${editorOptions.type} ${classList}`} data-id={editorOptions.errFile} onClick={() => handleErrorClick(editorOptions)}>
             { editorOptions.useSpan ? <span> { messageText } </span> : <pre><span>{ messageText }</span></pre> }
+            <div className="ai-explain" data-id="rendererExplain" title="Explain this error with AI" onClick={handleExplain}>
+              <i className="fas fa-magic"></i>
+            </div>
             <div className="close" data-id="renderer" onClick={handleClose}>
               <i className="fas fa-times"></i>
             </div>

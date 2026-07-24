@@ -50,6 +50,9 @@ export class CompilerArtefacts extends Plugin {
     this.on('solidity', 'compilationFinished', (file, source, languageVersion, data) => {
       this.compilersArtefacts.__last = new CompilerAbstract(languageVersion, data, source)
       saveCompilationPerFileResult(file, source, languageVersion, data)
+      // read-only debug handle on the already-public artifacts map (used by
+      // e2e to assert languageversion carries the real solc version)
+      if (typeof window !== 'undefined') (window as any).__compilersArtefacts = this.compilersArtefacts
     })
 
     this.on('yulp', 'compilationFinished', (file, source, languageVersion, data) => {

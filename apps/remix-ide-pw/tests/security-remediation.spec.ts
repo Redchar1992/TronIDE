@@ -1,7 +1,66 @@
 import { test, expect } from '@playwright/test'
 import { dismissWelcomeModal } from './helpers'
 
-test.describe('Security remediation regression tests (2026-05-20 / 2026-06-02)', () => {
+test.describe('Security remediation regression tests (2026-05-20 / 2026-06-02 / 2026-07-21)', () => {
+  test('URL hash blocks unsafe actions while preserving file-open deep links', { tag: '@gate' }, async ({ page }) => {
+    await page.goto('/#activate=solidity&call=fileManager//writeFile//contracts/EVIL.sol//INJECTED')
+    await dismissWelcomeModal(page)
+    await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+
+    const injected = await page.evaluate(async () => {
+      const fs = (window as any).remixFileSystem
+      return await new Promise((resolve) => {
+        fs.readFile('.workspaces/default_workspace/contracts/EVIL.sol', 'utf8', (error: Error | null, data: unknown) => {
+          resolve(error ? null : String(data))
+        })
+      })
+    })
+    expect(injected).toBeNull()
+
+    // Use the legacy `?` form here to force a full navigation; QueryParams
+    // rewrites it to the equivalent hash during boot.
+    await page.goto('/?activate=remixd')
+    await dismissWelcomeModal(page)
+    await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+    await expect(page.locator('.modal-content').filter({ hasText: 'Connect to localhost' })).toHaveCount(0)
+
+    // Keep the established non-mutating deep-link behavior: callers can still
+    // open an existing workspace file and select an ordinary IDE panel.
+    await page.goto('/?activate=solidity&call=fileManager//open//contracts/3_Ballot.sol&deactivate=home')
+    await dismissWelcomeModal(page)
+    await page.locator('#input').waitFor({ timeout: 15_000 })
+    await expect.poll(async () => page.evaluate(() => {
+      const editor = (document.getElementById('input') as any)?.editor
+      return editor ? editor.session.getValue() : ''
+    }), { timeout: 15_000 }).toContain('contract Ballot')
+  })
+
+  test('URL import rejects localhost before issuing a network request', { tag: '@gate' }, async ({ page }) => {
+    let targetRequests = 0
+    page.on('request', (request) => {
+      if (request.url().startsWith('http://127.0.0.1:8545/')) targetRequests++
+    })
+
+    // Seed a real workspace first so the URL-import startup branch is reached
+    // (a brand-new profile otherwise stops at the separate "no workspace" alert).
+    await page.goto('/')
+    await dismissWelcomeModal(page)
+    const initialAlertOk = page.locator('#modal-footer-ok')
+    if (await initialAlertOk.isVisible().catch(() => false)) await initialAlertOk.click()
+    await page.locator('[data-id="workspaceCreate"]').click()
+    const input = page.locator('input[data-id="modalDialogCustomPromptTextCreate"]')
+    await input.waitFor({ state: 'visible', timeout: 5_000 })
+    await input.fill('security-url-import')
+    await page.locator('[data-id="workspacesModalDialog-modal-footer-ok-react"]').click()
+    await expect(page.locator('select[data-id="workspacesSelect"]')).toHaveValue('security-url-import', { timeout: 15_000 })
+
+    await page.goto('/?url=http://127.0.0.1:8545/private')
+    await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+    await page.waitForTimeout(2_000)
+    expect(targetRequests).toBe(0)
+    await expect(page.locator('select[data-id="workspacesSelect"] option[value="code-sample"]')).toHaveCount(0)
+  })
+
   test('terminal HTML links are sanitized and dangerous protocols are stripped', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 1000 })
     await page.goto('/')

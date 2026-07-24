@@ -39,16 +39,6 @@ export class CompilerImports extends Plugin {
     this.previouslyHandled = {} // cache import so we don't make the request at each compilation.
   }
 
-  async setToken () {
-    try {
-      const protocol = typeof window !== 'undefined' && window.location.protocol
-      const token = await this.call('settings', 'get', 'settings/gist-access-token')
-      this.urlResolver.setGistToken(token, protocol)
-    } catch (error) {
-      console.log(error)
-    }
-  }
-
   isRelativeImport (url) {
     return /^([^/]+)/.exec(url)
   }
@@ -92,7 +82,10 @@ export class CompilerImports extends Plugin {
 
     let resolved
     try {
-      await this.setToken()
+      // Compilation imports are fetched anonymously: the resolver's github
+      // handler hits raw.githubusercontent.com with no credentials, so no
+      // token (Settings PAT or the in-memory connect token) is wired in here.
+      // The Settings PAT only backs gist load/publish fallbacks elsewhere.
       resolved = await this.urlResolver.resolve(url)
       console.log(resolved)
       const { content, cleanUrl, type } = resolved
@@ -108,18 +101,41 @@ export class CompilerImports extends Plugin {
     }
   }
 
-  importExternal (url, targetPath, cb) {
+  async importExternal (url, targetPath, cb) {
+    let provider
+    let mutationContext
+    try {
+      // Resolve and bind the destination provider before starting the network
+      // import. WorkspaceFileProvider generations change on checkout/workspace
+      // switch, so the same context can reject a late dependency write.
+      provider = await this.call('fileManager', 'getProviderOf', null)
+      if (provider && typeof provider.captureMutationContext === 'function') {
+        mutationContext = await provider.captureMutationContext()
+      }
+    } catch (error) {
+      // Preserve compilation when no writable provider is available. The
+      // dependency can still be returned to solc; it simply must not be cached
+      // without a bound mutation context.
+      console.debug('[contentImport] could not bind dependency cache write', error)
+      provider = null
+      mutationContext = undefined
+    }
+
     this.import(url,
       // TODO: handle this event
       (loadingMsg) => { this.emit('message', loadingMsg) },
-      async (error, content, cleanUrl, type, url) => {
+      (error, content, cleanUrl, type, url) => {
         if (error) return cb(error)
         try {
-          const provider = await this.call('fileManager', 'getProviderOf', null)
-          const path = targetPath || type + '/' + cleanUrl
-          if (provider) provider.addExternal('.deps/' + path, content, url)
+          // FileManager strips the virtual `browser/` provider prefix before
+          // workspace writes. Do the same for this direct-provider path.
+          const path = String(targetPath || type + '/' + cleanUrl).replace(/^\/?browser(?:\/|$)/, '')
+          if (provider) {
+            const accepted = provider.addExternal('.deps/' + path, content, url, mutationContext)
+            if (accepted === false) return cb(new Error('The workspace changed before the imported dependency could be written.'))
+          }
         } catch (err) {
-
+          return cb(err)
         }
         cb(null, content)
       }, null)

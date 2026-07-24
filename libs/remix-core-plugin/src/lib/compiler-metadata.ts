@@ -50,6 +50,24 @@ export class CompilerMetadata extends Plugin {
   onActivation () {
     var self = this
     this.on('solidity', 'compilationFinished', async (file, source, languageVersion, data) => {
+      // Bind generated artifacts to the workspace in which this compilation
+      // result was received. Compilation handling performs several async reads
+      // before writing; without this context a checkout in between would let
+      // FileManager bind the eventual writes to the destination branch.
+      let mutationContext
+      try {
+        mutationContext = await this.call('fileManager', 'captureWorkspaceMutationContext', (source && source.target) || '/')
+      } catch (error) {
+        // localhost paths name their provider explicitly and are not affected
+        // by the mutable browser-workspace/branch selection. Keep their legacy
+        // artifact generation behavior even though that provider has no
+        // workspace-generation API.
+        if (/^\/?localhost(?:\/|$)/.test(String(source && source.target))) mutationContext = undefined
+        else {
+          console.error('[ERROR] Could not bind compiler artifacts to the active workspace. No artifacts were written.', error)
+          return
+        }
+      }
       if (!await this.call('settings', 'get', 'settings/generate-contract-metadata')) return
       const compiler = new CompilerAbstract(languageVersion, data, source)
       var path = self._extractPathOf(source.target)
@@ -58,7 +76,7 @@ export class CompilerMetadata extends Plugin {
         (async () => {
           const fileName = self._JSONFileName(path, contract.name)
           const content = await this.call('fileManager', 'exists', fileName) ? await this.call('fileManager', 'readFile', fileName) : null
-          await this._setArtefacts(content, contract, path)
+          await this._setArtefacts(content, contract, path, mutationContext)
         })()
       })
     })
@@ -70,7 +88,7 @@ export class CompilerMetadata extends Plugin {
     return path ? path[1] : '/'
   }
 
-  async _setArtefacts (content, contract, path) {
+  async _setArtefacts (content, contract, path, mutationContext) {
     console.log('[INFO] Setting artifacts for contract:', contract)
     let metadata
     let contentToParse = content
@@ -118,7 +136,7 @@ export class CompilerMetadata extends Plugin {
 
     if (parsedMetadata) { // 只有当 parsedMetadata 成功解析后才写入文件
       try {
-        await this.call('fileManager', 'writeFile', metadataFileName, JSON.stringify(parsedMetadata, null, '\t'))
+        await this.call('fileManager', 'writeFile', metadataFileName, JSON.stringify(parsedMetadata, null, '\t'), mutationContext)
       } catch (writeError) {
         console.error(`[ERROR] Failed to write metadata file "${metadataFileName}". Error:`, writeError)
       }
@@ -140,7 +158,7 @@ export class CompilerMetadata extends Plugin {
     }
 
     try {
-      await this.call('fileManager', 'writeFile', fileName, JSON.stringify(data, null, '\t'))
+      await this.call('fileManager', 'writeFile', fileName, JSON.stringify(data, null, '\t'), mutationContext)
     } catch (writeError) {
       console.error(`[ERROR] Failed to write main artifact file "${fileName}". Error:`, writeError)
     }

@@ -23,6 +23,9 @@ import { migrateToWorkspace } from '../../../migrateFileSystem'
 import { CompilerImports } from '@remix-project/core-plugin'
 import { workspace } from '@remix-project/remix-lib'
 import JSZip from 'jszip'
+import { connectWithGithubOAuth } from '../../../lib/github-oauth'
+import * as githubAuth from '../../../lib/github-auth'
+import { disconnectGithub } from '../../../lib/github-connection'
 
 const yo = require('yo-yo')
 const csjs = require('csjs-inject')
@@ -191,6 +194,21 @@ const css = csjs`
     color: var(--home-accent);
     font-weight: 700;
     margin-bottom: 14px;
+  }
+  .heroNotesLink {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    color: inherit;
+    opacity: .75;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .heroNotesLink:hover, .heroNotesLink:focus-visible {
+    opacity: 1;
   }
   .heroLogo {
     width: 12px;
@@ -413,6 +431,7 @@ const css = csjs`
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     padding-bottom: 10px;
     border-bottom: 1px solid var(--home-border);
   }
@@ -439,9 +458,17 @@ const css = csjs`
   .panelMore {
     font-size: 12px;
     color: var(--home-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+    /* Most panelMore spans are STATUS LABELS (e.g. "Session token mode",
+       "Live status"), not buttons — a pointer cursor made them look clickable
+       and users tried clicking them. Only the .panelMoreClickable variant
+       (e.g. "Explore all plugins →") is interactive. */
+  }
+  .panelMoreClickable {
     cursor: pointer;
   }
-  .panelMore:hover {
+  .panelMoreClickable:hover {
     color: var(--home-accent);
     opacity: 1;
   }
@@ -948,7 +975,7 @@ export class LandingPage extends ViewPlugin {
 
   alertDownloadFiles = async () => {
     try {
-      tooltip('preparing files for download, please wait..')
+      tooltip('Preparing files for download, please wait...')
       const fileProviders = globalRegistry.get('fileproviders').api
       const zip = new JSZip()
       await fileProviders.browser.copyFolderToJson('/', ({ path, content }) => {
@@ -1077,6 +1104,16 @@ export class LandingPage extends ViewPlugin {
       const title = `Import from ${service}`
       modalDialogCustom.prompt(title, msg, null, (target) => {
         if (target !== '') {
+          let mutationContext
+          try {
+            // Capture before the resolver starts its network request. A later
+            // checkout/workspace switch must reject the fetched content rather
+            // than write it into whichever branch happens to be active then.
+            mutationContext = fileProviders.workspace.captureMutationContext()
+          } catch (e) {
+            modalDialogCustom.alert(title, e.message || e)
+            return
+          }
           compilerImport.import(
             target,
             (loadingMsg) => { tooltip(loadingMsg) },
@@ -1085,10 +1122,12 @@ export class LandingPage extends ViewPlugin {
                 modalDialogCustom.alert(title, error.message || error)
               } else {
                 try {
-                  fileProviders.workspace.addExternal(type + '/' + cleanUrl, content, url)
+                  const externalPath = (type + '/' + cleanUrl).replace(/^\/?browser(?:\/|$)/, '')
+                  const accepted = fileProviders.workspace.addExternal(externalPath, content, url, mutationContext)
+                  if (accepted === false) throw new Error('The workspace changed before the imported file could be written.')
                   this.verticalIcons.select('filePanel')
                 } catch (e) {
-                  modalDialogCustom.alert(title, e.message)
+                  modalDialogCustom.alert(title, e.message || e)
                 }
               }
             }
@@ -1115,6 +1154,22 @@ export class LandingPage extends ViewPlugin {
       await this.appManager.activatePlugin('pluginManager')
       this.verticalIcons.select('pluginManager')
     }
+    const openGitPanel = async () => {
+      try {
+        await this.appManager.activatePlugin(['gitPanel'])
+        this.verticalIcons.select('gitPanel')
+      } catch (e) {
+        tooltip((e && e.message) || 'Unable to open the Git panel.')
+      }
+    }
+    const openReleaseNotes = async () => {
+      try {
+        await this.appManager.activatePlugin('releaseNotes')
+        await this.call('tabs', 'focus', 'releaseNotes')
+      } catch (e) {
+        tooltip((e && e.message) || 'Unable to open the release notes.')
+      }
+    }
     const startRestoreBackupZip = async () => {
       if (await this.appManager.isActive('restorebackupzip')) {
         await this.call('tabs', 'focus', 'restorebackupzip')
@@ -1136,16 +1191,77 @@ export class LandingPage extends ViewPlugin {
 
     const createTemplateFile = async (template) => {
       try {
+        const fileManager = globalRegistry.get('filemanager').api
+        // Bind the click before activation, filesystem reads, and a possible
+        // overwrite confirmation. A branch/workspace switch while the dialog
+        // is open must not redirect the accepted overwrite into the new tree.
+        const mutationContext = fileManager.captureWorkspaceMutationContext(template.path)
         await this.appManager.activatePlugin('filePanel')
         this.verticalIcons.select('filePanel')
-        const fileManager = globalRegistry.get('filemanager').api
-        await fileManager.writeFile(template.path, template.content)
-        await fileManager.open(template.path)
-        tooltip(`${template.name} created at ${template.path}`)
+        const writeAndOpen = async (verb) => {
+          await fileManager.writeFile(template.path, template.content, mutationContext)
+          await fileManager.open(template.path)
+          tooltip(`${template.name} ${verb} at ${template.path}`)
+        }
+        const exists = await fileManager.exists(template.path)
+        if (exists) {
+          const current = await fileManager.readFile(template.path)
+          if (current === template.content) {
+            // Already present and unchanged: nothing to write. Say so honestly
+            // (the old path silently re-wrote and claimed "created", which read
+            // as "the click did nothing / lied").
+            await fileManager.open(template.path)
+            tooltip(`${template.path} already exists in this workspace (unchanged) — opened it.`)
+            return
+          }
+          // Exists but the user has diverged from the template — never silently
+          // clobber their edits (DEF-R1-1); confirm the overwrite first.
+          modalDialog(`Overwrite ${template.path}?`, yo`
+            <div data-id="landingTemplateOverwriteBody">${template.path} already exists and differs from the template. Overwrite it with the template content?</div>`,
+          {
+            label: 'Overwrite',
+            fn: async () => {
+              try {
+                await writeAndOpen('overwritten')
+              } catch (error) {
+                console.log(error)
+                tooltip(error.message || error)
+              }
+            }
+          },
+          { label: 'Cancel', fn: () => {} })
+          return
+        }
+        await writeAndOpen('created')
       } catch (error) {
         console.log(error)
         tooltip(error.message || error)
       }
+    }
+
+    // All TRON templates are offered, not just the first one: a small chooser
+    // writes the picked template into the current workspace.
+    const chooseTemplateFile = () => {
+      if (!tronTemplates.length) return createNewFile()
+      const select = yo`
+        <select class="form-control custom-select" data-id="landingTemplateSelect">
+          ${tronTemplates.map((template) => yo`<option value="${template.id}" title="${template.description}">${template.name}</option>`)}
+        </select>`
+      modalDialog('Start from a TRON template', yo`
+        <div>
+          <div class="mb-2">The template contract is added to the current workspace.</div>
+          ${select}
+        </div>`,
+      {
+        label: 'Create',
+        fn: () => {
+          const picked = tronTemplates.find((template) => template.id === select.value) || tronTemplates[0]
+          createTemplateFile(picked)
+        }
+      }, {
+        label: 'Cancel',
+        fn: () => {}
+      })
     }
 
     const saveAs = (blob, name) => {
@@ -1168,7 +1284,7 @@ export class LandingPage extends ViewPlugin {
 
     const downloadFiles = async () => {
       try {
-        tooltip('preparing files for download, please wait..')
+        tooltip('Preparing files for download, please wait...')
         const fileProviders = globalRegistry.get('fileproviders').api
         const zip = new JSZip()
         await fileProviders.browser.copyFolderToJson('/', ({ path, content }) => {
@@ -1201,8 +1317,10 @@ export class LandingPage extends ViewPlugin {
       try {
         await this.appManager.activatePlugin(['udapp'])
         this.verticalIcons.select('udapp')
-        const result = await this.call('udapp', 'connectInjectedTronWeb')
-        if (result && result.connected === false) tooltip(result.error || 'Cannot connect TronLink')
+        // connectInjectedTronWeb surfaces EVERY outcome (connected / already
+        // connected / locked / unavailable) via its own toast, so we must NOT
+        // tooltip the error again here — that produced two identical toasts.
+        await this.call('udapp', 'connectInjectedTronWeb')
       } catch (error) {
         console.log(error)
         tooltip(error.message || error)
@@ -1339,28 +1457,41 @@ export class LandingPage extends ViewPlugin {
       open: false,
       items: readJsonStorage('tronide.home.notifications', []).slice(0, 8)
     }
-    // GitHub tokens are kept in sessionStorage only (per-tab) and cleared with the tab.
-    // Any previously-persisted localStorage copies are scrubbed at startup.
+    // GitHub tokens live in this tab's session (lib/github-auth): a refresh keeps
+    // the connection, while closing the tab clears it. Never promote the token
+    // to localStorage/config. Defensive: scrub only the historical persistent
+    // copies left by older versions.
     try { window.localStorage.removeItem('tronide.github.token') } catch (error) { console.debug('[home] failed to clear legacy github token', error) }
     try { window.localStorage.removeItem('tronide.github.user') } catch (error) { console.debug('[home] failed to clear legacy github user', error) }
+    // `githubTokenState` is a render-side mirror of the tab-session store; the
+    // authoritative copy is githubAuth.getToken()/getLogin().
     const githubTokenState = {
-      token: window.sessionStorage.getItem('tronide.github.token') || '',
-      user: null
+      get token () { return githubAuth.getToken() },
+      // live like `token` — a snapshot here went stale the moment the login
+      // changed through another surface (header connect/disconnect). Existing
+      // call sites assign the /user API object; forward that to the store so
+      // every consumer (header included) sees it via the changed event.
+      get user () { return githubAuth.getLogin() ? { login: githubAuth.getLogin() } : null },
+      set user (value) { githubAuth.setLogin(value && value.login ? value.login : '') }
     }
     const advancedToolsState = {
       open: window.localStorage.getItem('tronide.home.advancedToolsOpen') === 'true'
     }
     const pluginCards = [
-      ['landingPluginContractVerification', 'landingPluginToggleContractVerification', 'contractVerification', 'TRON Contract Verification', 'TronIDE', 'Prepare a TronScan-first verification package and check public source status for TRON contracts.', 'Open Verification', () => openContractVerification()],
+      ['landingPluginContractVerification', 'landingPluginToggleContractVerification', 'contractVerification', 'TRON Contract Verification', 'TronIDE', 'Download a flattened Solidity file, keep the exact compiler settings, and check public source status on TronScan.', 'Open Verification', () => openContractVerification()],
       ['landingPluginSolidityAnalyzers', 'landingPluginToggleAnalyzers', 'solidityStaticAnalysis', 'TVM Solidity Analyzers', 'TronIDE', 'Analyze Solidity with Remix, Solhint, Slither-compatible checks, and TRON transaction guardrails.', 'Open Analyzer', () => startSolidityAnalyzer()],
-      ['landingPluginCookbook', 'landingPluginToggleCookbook', 'pluginManager', 'TRON Cookbook', 'TronIDE', 'Find TRON templates, Solidity libraries, and protocol examples from curated resources.', 'Search TRON templates', () => startPluginManager()]
+      // Not a plugin (empty pluginName). Distinct from "Use TRON Template" in
+      // Start building (which adds a template FILE to the CURRENT workspace):
+      // this creates a NEW workspace from a template. Gives Home a
+      // workspace-creation entry and removes the duplicate template-file action.
+      ['landingPluginCookbook', 'landingPluginToggleCookbook', '', 'New TRON Workspace', 'TronIDE', 'Create a new workspace from a curated TRON template (TRC20, TRC721, and more).', 'New workspace', () => createWorkspaceFromHome()]
     ]
     const saveNotifications = () => {
       try { window.localStorage.setItem('tronide.home.notifications', JSON.stringify(notificationState.items.slice(0, 8))) } catch (error) { console.debug('[home] failed to persist notifications', error) }
       try { window.dispatchEvent(new CustomEvent('tronideHomeNotificationsChanged')) } catch (error) { console.debug('[home] failed to dispatch notifications-changed event', error) }
     }
     const addNotification = (title, message, type = 'info') => {
-      notificationState.items.unshift({ title, message, type, time: new Date().toLocaleTimeString() })
+      notificationState.items.unshift({ title, message, type, time: new Date().toLocaleTimeString(), read: false })
       notificationState.items = notificationState.items.slice(0, 8)
       saveNotifications()
     }
@@ -1408,54 +1539,31 @@ export class LandingPage extends ViewPlugin {
       }
       return payload
     }
-    // Bridge the Home/Header GitHub token into the IDE config key that gist publish/load
-    // read (`settings/gist-access-token`, the same key the Settings tab writes). Without
-    // this, connecting a token from the header still left gist publishing asking the user
-    // to set a token in Settings. Keep this in lockstep with the sessionStorage copy so
-    // connect/reconnect/disconnect all stay consistent across both token stores.
-    const syncGistAccessToken = (token) => {
-      try {
-        const config = globalRegistry.get('config') && globalRegistry.get('config').api
-        if (config && typeof config.set === 'function') config.set('settings/gist-access-token', String(token || '').trim())
-      } catch (error) { console.debug('[home] failed to sync gist access token', error) }
-    }
     const saveGithubToken = (token) => {
-      githubTokenState.token = String(token || '').trim()
-      window.sessionStorage.setItem('tronide.github.token', githubTokenState.token)
-      // Defensive: scrub any historical localStorage copy so this session is the only place the token lives.
-      try { window.localStorage.removeItem('tronide.github.token') } catch (error) { console.debug('[home] failed to clear legacy github token', error) }
-      // Mirror into the gist access-token config so publishing a gist works without a Settings round-trip.
-      syncGistAccessToken(githubTokenState.token)
+      // github-auth owns the tab-scoped sessionStorage mirror. Every reader
+      // (gist publish/load, header, dgitProvider) still goes through getToken(),
+      // and no persistent localStorage/config copy is written.
+      githubAuth.setToken(token, githubAuth.getLogin())
     }
-    // Persist the connected GitHub login for cross-component consumers (the
-    // header button) and signal connect/disconnect so they can update live.
+    // Update the connected GitHub login in the tab-session store; setLogin (like
+    // setToken/clearToken) dispatches 'tronideGithubConnectionChanged' so the
+    // header and any other live consumer update immediately.
     const persistGithubUser = (login) => {
-      try {
-        if (login) window.sessionStorage.setItem('tronide.github.user', login)
-        else window.sessionStorage.removeItem('tronide.github.user')
-      } catch (error) { console.debug('[home] failed to persist github user', error) }
-      try { window.dispatchEvent(new CustomEvent('tronideGithubConnectionChanged')) } catch (error) { console.debug('[home] failed to dispatch github-changed event', error) }
+      githubAuth.setLogin(login)
     }
     const clearGithubToken = (silent = false) => {
-      githubTokenState.token = ''
-      githubTokenState.user = null
-      window.sessionStorage.removeItem('tronide.github.token')
-      // Clear the bridged gist access-token config too, so disconnecting here also stops gist
-      // publish/load from using the now-revoked token.
-      syncGistAccessToken('')
-      // Keep removing legacy localStorage entries from older versions so an old persisted token
-      // does not survive a disconnect on upgraded browsers.
-      try { window.localStorage.removeItem('tronide.github.token') } catch (error) { console.debug('[home] failed to clear legacy github token', error) }
-      try { window.localStorage.removeItem('tronide.github.user') } catch (error) { console.debug('[home] failed to clear legacy github user', error) }
+      // Full disconnect (tab-session token + legacy web storage + the config-backed
+      // Settings gist token). Shared with the header GitHub menu via
+      // lib/github-connection so the two disconnect paths cannot diverge.
+      disconnectGithub()
       if (!silent) addNotification('GitHub disconnected', 'GitHub token was cleared from this browser tab.')
       refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel)
-      persistGithubUser('')
     }
     const connectGithubToken = () => {
       const message = yo`
         <div>
-          <div>Paste a fine-grained GitHub token. OAuth write flows remain out of scope for this MVP.</div>
-          <div class=${css.securityNote}>Tokens stay in this browser tab only and are cleared when you close it. Recommended scopes: Contents read for import; Contents read/write only when committing. Limit the token to selected repositories.</div>
+          <div>Paste a fine-grained GitHub token — or skip this and use Connect GitHub in the header to sign in with OAuth instead.</div>
+          <div class=${css.securityNote}>Tokens stay in this browser tab, survive a refresh, and are cleared when you close it. Recommended scopes: Contents read for import; Contents read/write only when committing. Limit the token to selected repositories.</div>
         </div>
       `
       modalDialogCustom.promptPassphrase('Connect GitHub Token', message, '', async (token) => {
@@ -1480,7 +1588,37 @@ export class LandingPage extends ViewPlugin {
         }
       }, null, true)
     }
+    // OAuth popup connect — no PAT pasting. Reuses the same token sinks as the
+    // PAT path (saveGithubToken mirrors the gist token; persistGithubUser syncs
+    // the header), so gist + Git-panel keep working unchanged.
+    const connectGithubOAuth = async () => {
+      tooltip('Opening GitHub authorization…')
+      try {
+        const { token, login } = await connectWithGithubOAuth()
+        saveGithubToken(token)
+        githubTokenState.user = login ? { login } : await githubRequest('/user')
+        const name = (githubTokenState.user && githubTokenState.user.login) || 'Connected.'
+        addNotification('GitHub connected', name)
+        refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel)
+        tooltip(`GitHub connected as ${name}`)
+        persistGithubUser(githubTokenState.user && githubTokenState.user.login)
+      } catch (error) {
+        const msg = (error && error.message) || 'GitHub authorization failed.'
+        addNotification('GitHub connection failed', msg, 'error')
+        tooltip(msg)
+      }
+    }
     const importGithubFileWithToken = () => {
+      let mutationContext
+      try {
+        // Capture before showing the prompt and before the GitHub request. If
+        // its response arrives after a branch/workspace switch, writeFile will
+        // reject this exact stale context at the provider mutation boundary.
+        mutationContext = fileManager.captureWorkspaceMutationContext('/')
+      } catch (error) {
+        tooltip(error.message || error)
+        return
+      }
       modalDialogCustom.prompt('Import private GitHub file', 'Paste a GitHub file URL from an authorized repository.', '', async (url) => {
         try {
           const target = parseGithubUrl(url)
@@ -1491,7 +1629,7 @@ export class LandingPage extends ViewPlugin {
           const safeRepo = assertSafeGithubRepoPath(target.repo)
           const localPath = `github/${safeOwner}/${safeRepo}/${target.path}`
           if (!localPath.startsWith(`github/${safeOwner}/${safeRepo}/`)) throw new Error('Refusing to write outside the github/<owner>/<repo>/ folder.')
-          await fileManager.writeFile(localPath, content)
+          await fileManager.writeFile(localPath, content, mutationContext)
           await fileManager.open(localPath)
           addNotification('GitHub file imported', localPath)
         } catch (error) {
@@ -1499,7 +1637,7 @@ export class LandingPage extends ViewPlugin {
         }
       })
     }
-    const copyGithubTokenChecklist = () => {
+    const copyGithubTokenChecklist = async () => {
       const checklist = [
         'TronIDE GitHub Token checklist',
         '- Use a fine-grained personal access token.',
@@ -1508,10 +1646,16 @@ export class LandingPage extends ViewPlugin {
         '- Prefer session storage on shared devices.',
         '- Revoke the token from GitHub settings if the browser is untrusted.'
       ].join('\n')
+      // clipboard.writeText returns a PROMISE that rejects asynchronously
+      // (blocked permission / insecure context) — the old sync try/catch never
+      // caught that, and success only added a silent bell notification, so the
+      // click looked like nothing happened. Await it and always show a toast.
       try {
-        window.navigator.clipboard.writeText(checklist)
+        await window.navigator.clipboard.writeText(checklist)
         addNotification('GitHub checklist copied', 'Token permission checklist copied to clipboard.', 'github')
+        tooltip('GitHub token checklist copied to clipboard.')
       } catch (error) {
+        // Clipboard unavailable — show the checklist itself so the user still gets it.
         tooltip(checklist)
       }
     }
@@ -1653,11 +1797,19 @@ export class LandingPage extends ViewPlugin {
     const createWorkspaceFromHome = async () => {
       try {
         await this.appManager.activatePlugin('filePanel')
-        const workspaceName = `tron_workspace_${Date.now()}`
-        await this.call('filePanel', 'createWorkspace', workspaceName)
         this.verticalIcons.select('filePanel')
-        tooltip(`Workspace created: ${workspaceName}`)
-        addNotification('Workspace created', workspaceName)
+        // Open the File Explorer's Create Workspace dialog — it has the TRON
+        // template dropdown (Default / SimpleStorage / TRC20 / TRC721 / …) — so
+        // the user picks a template, rather than silently getting an auto-named
+        // empty workspace. The button appears once the panel has rendered; retry
+        // briefly, then fall back to a guiding tooltip.
+        let clicked = false
+        for (let i = 0; i < 25; i++) {
+          const btn = document.querySelector('[data-id="workspaceCreate"]')
+          if (btn) { btn.click(); clicked = true; break }
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        if (!clicked) tooltip('Open the File Explorer and click the + next to Workspaces to create a new workspace.')
       } catch (error) {
         console.log(error)
         tooltip(error.message || error)
@@ -1680,6 +1832,15 @@ export class LandingPage extends ViewPlugin {
       const el = container && container.querySelector(`[data-id="${dataId}"]`)
       if (el) yo.update(el, renderFn())
     }
+
+    // A connect/disconnect from ANY surface (the header menu in particular)
+    // must refresh this panel too: its own flows call refreshHomeSection
+    // directly, but a header-menu Disconnect only dispatched the event — the
+    // Home button then kept advertising "Reconnect GitHub" against an empty
+    // token store until a full reload.
+    window.addEventListener('tronideGithubConnectionChanged', () => {
+      try { refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel) } catch (error) { console.debug('[home] github panel refresh failed', error) }
+    })
 
     const openAdvancedTools = () => {
       if (advancedToolsState.open) return
@@ -1717,8 +1878,12 @@ export class LandingPage extends ViewPlugin {
       if (isElementCollapsed(side)) toggleLayoutControl('side')
       if (isElementCollapsed(terminalPanel)) toggleLayoutControl('bottom')
       if (isElementCollapsed(ai)) toggleLayoutControl('ai')
-      tooltip('Layout restored to default workspace view.')
-      addNotification('Layout reset', 'Side, Bottom, and AI panels were restored to their default views.', 'info')
+      // Layout reset restores the PANELS only. It intentionally does not touch
+      // the active workspace — say so, since "default workspace view" wrongly
+      // read as "switch back to the default workspace". To change workspace,
+      // use the Workspaces dropdown.
+      tooltip('Layout reset — side, terminal and AI panels restored. Your workspace and files are unchanged.')
+      addNotification('Layout reset', 'Side, Bottom, and AI panels were restored to their default views. The active workspace is unchanged.', 'info')
     }
 
     const exportWorkspaceForGit = async () => {
@@ -1740,8 +1905,12 @@ export class LandingPage extends ViewPlugin {
       const account = injected.tronWeb.defaultAddress && injected.tronWeb.defaultAddress.base58
       const host = injected.tronWeb.fullNode && injected.tronWeb.fullNode.host
       const network = /nile/i.test(host || '') ? 'Nile' : (/shasta/i.test(host || '') ? 'Shasta' : (/trongrid|api\.tronstack|api\.trongrid/i.test(host || '') ? 'Mainnet' : 'Custom node'))
-      const message = account ? `${account} · ${network}` : `TronLink detected · ${network}; unlock and authorize to expose an account.`
+      const message = account ? `TronLink ready: ${account} · ${network}` : `TronLink detected on ${network}, but locked or not authorized — unlock it and approve this site to expose an account.`
       addNotification('TronLink readiness', message, 'wallet')
+      // Also show a visible toast: the locked/unauthorized case only added a
+      // (silent) bell notification, so an explicit "check" click looked like
+      // nothing happened.
+      tooltip(message)
     }
 
     const isPluginActive = (pluginName) => pluginName ? this.appManager.actives.includes(pluginName) : false
@@ -1799,7 +1968,7 @@ export class LandingPage extends ViewPlugin {
               <div class=${css.quickStartCardTitle}>Prepare Workspace</div>
               <div class=${css.quickStartCardDesc}>Create a clean workspace before compiling, testing, and deploying TRON contracts.</div>
             </button>
-            <button class=${css.quickStartCard} data-id="landingDappStarterCard" onclick=${() => tronTemplates[0] ? createTemplateFile(tronTemplates[0]) : createNewFile()}>
+            <button class=${css.quickStartCard} data-id="landingDappStarterCard" onclick=${() => chooseTemplateFile()}>
               <div class=${css.quickStartIcon}>⌁</div>
               <div class=${css.quickStartCardTitle}>Start building a TRON DApp</div>
               <div class=${css.quickStartCardDesc}>Start from TVM-safe TRON templates for deployment, transactions, and TronScan verification.</div>
@@ -1810,7 +1979,7 @@ export class LandingPage extends ViewPlugin {
           <div class=${css.workspaceTileTitle}><span class=${css.panelHeadIcon}>?</span> First Time? Start Here!</div>
           <div class=${css.fileDesc}>Start with TRON docs, a clean workspace, and TVM-safe templates.</div>
           <button class=${css.loadChip} aria-label="Create workspace" onclick=${() => createWorkspaceFromHome()}>Prepare workspace</button>
-          <button class=${css.loadChip} aria-label="Open TRON DApp template" onclick=${() => tronTemplates[0] ? createTemplateFile(tronTemplates[0]) : createNewFile()}>Open TRON DApp template</button>
+          <button class=${css.loadChip} aria-label="Open TRON DApp template" onclick=${() => chooseTemplateFile()}>Open TRON DApp template</button>
         </div>
       </section>
     `
@@ -1821,7 +1990,9 @@ export class LandingPage extends ViewPlugin {
       pluginManager: 'fas fa-book'
     }
     const renderPluginCard = (dataId, toggleId, pluginName, title, maintainer, description, actionLabel, action) => {
-      const active = pluginName ? isPluginActive(pluginName) : true
+      // No pluginName => this card isn't a plugin (e.g. the template picker):
+      // don't show an "ON" badge or an Activate/Deactivate toggle for it.
+      const active = pluginName ? isPluginActive(pluginName) : false
       const iconClass = pluginCardIcons[pluginName] || 'fas fa-cube'
       return yo`
       <button class=${css.pluginCard} data-id=${dataId} onclick=${action}>
@@ -1842,7 +2013,7 @@ export class LandingPage extends ViewPlugin {
       <section class=${css.panel} data-id="landingMostUsedPlugins">
         <div class=${css.panelHead}>
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>🔥</span> Most used plugins</h3>
-          <span class=${css.panelMore} data-id="landingExploreAllPluginsButton" role="button" tabindex="0" aria-label="Open all plugins" onclick=${() => startPluginManager()}>Explore all plugins →</span>
+          <span class="${css.panelMore} ${css.panelMoreClickable}" data-id="landingExploreAllPluginsButton" role="button" tabindex="0" aria-label="Open all plugins" onclick=${() => startPluginManager()}>Explore all plugins →</span>
         </div>
         <div class=${css.pluginGrid}>
           ${pluginCards.map((card) => renderPluginCard(...card))}
@@ -1854,7 +2025,7 @@ export class LandingPage extends ViewPlugin {
       const recipes = [
         ['TronLink readiness', 'Check injection, account, and Nile/Shasta/Mainnet host before deployment.', checkTronLinkReadiness, 'landingRecipeTronLink'],
         ['Nile deploy checklist', 'Compile, switch TronLink to Nile, set feeLimit, deploy, then verify on TronScan.', startInjectedTronWeb, 'landingRecipeNileDeploy'],
-        ['Verification package', 'Compile first, open Contract Verification, generate package, then submit on TronScan.', openContractVerification, 'landingRecipeVerification'],
+        ['Contract verification', 'Compile, select the deployed main contract, download its flattened .sol, then upload it on TronScan.', openContractVerification, 'landingRecipeVerification'],
         ['GitHub token safety', 'Copy the recommended token permission checklist before using private read/write.', copyGithubTokenChecklist, 'landingRecipeGithubToken']
       ]
       return yo`
@@ -1879,11 +2050,12 @@ export class LandingPage extends ViewPlugin {
       <section class=${css.panel} data-id="landingGithubTokenPanel">
         <div class=${css.panelHead}>
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>${githubIcon}</span> GitHub Token</h3>
-          <span class=${css.panelMore}>${githubTokenState.user && githubTokenState.user.login ? githubTokenState.user.login : 'Session token mode'}</span>
+          <span class=${css.panelMore} title=${githubTokenState.user && githubTokenState.user.login ? `Connected as ${githubTokenState.user.login}` : 'No token set yet. Tokens are kept for this browser session only (not saved to disk).'}>${githubTokenState.user && githubTokenState.user.login ? githubTokenState.user.login : 'Not connected'}</span>
         </div>
-        <div class=${css.securityNote}>For GitHub repository import/push — use a fine-grained PAT with the repository Contents permission (Gist publishing uses the separate 'gist' token in Settings). Default storage is session-only; remember mode stores the token in this browser and should be used only on trusted devices.</div>
+        <div class=${css.securityNote}>Use a fine-grained PAT with the <b>Contents</b> permission for repo import/push. The token stays in this tab, survives refresh, and is never written to persistent browser storage — use trusted devices only.</div>
         <div class=${css.loadChips}>
-          <button class=${css.loadChip} data-id="landingGithubTokenConnect" onclick=${() => connectGithubToken()}>${githubTokenState.token ? 'Reconnect token' : 'Connect token'}</button>
+          <button class=${css.loadChip} data-id="landingGithubOAuthConnect" onclick=${() => connectGithubOAuth()}>${githubTokenState.token ? 'Reconnect GitHub' : 'Connect to GitHub'}</button>
+          <button class=${css.loadChip} data-id="landingGithubTokenConnect" onclick=${() => connectGithubToken()}>${githubTokenState.token ? 'Reconnect token' : 'Connect token (PAT)'}</button>
           <button class=${css.loadChip} data-id="landingGithubTokenImport" onclick=${() => importGithubFileWithToken()}>Import private file</button>
           <button class=${css.loadChip} data-id="landingGithubTokenCommit" onclick=${() => commitCurrentFileToGithub()}>Commit current file</button>
           <button class=${css.loadChip} data-id="landingGithubTokenChecklist" onclick=${() => copyGithubTokenChecklist()}>Copy token checklist</button>
@@ -1942,12 +2114,12 @@ export class LandingPage extends ViewPlugin {
       <section class=${css.panel} data-id="landingGitWorkflowPanel">
         <div class=${css.panelHead}>
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>🔀</span> Git Workflow</h3>
-          <span class=${css.panelMore}>Frontend MVP</span>
+          <span class=${css.panelMore}>Beta</span>
         </div>
-        <div class=${css.fileDesc}>Prepare your local workspace files for Git repository synchronization or download compatibility bundles.</div>
+        <div class=${css.fileDesc}>Run Git on this workspace — init, commit, branch, and sync with GitHub (clone, push, pull) — or export the files as a zip bundle.</div>
         <div class=${css.loadChips}>
           <button class=${css.loadChip} data-id="landingGitPrepare" onclick=${() => exportWorkspaceForGit()}>Export Workspace Zip</button>
-          <a class=${css.loadChip} href="https://github.com/tronweb3/TronIDE" target="_blank" rel="noopener noreferrer">Git Help</a>
+          <button class=${css.loadChip} data-id="landingGitOpenPanel" onclick=${() => openGitPanel()}>Open Git Panel</button>
         </div>
       </section>
     `
@@ -1983,7 +2155,7 @@ export class LandingPage extends ViewPlugin {
             <div class=${css.quickStartCardTitle}>Create Contract</div>
             <div class=${css.quickStartCardDesc}>Start a new Solidity file in the current workspace.</div>
           </button>
-          <button class=${css.quickStartCard} data-id="landingDappStarterCard" onclick=${() => tronTemplates[0] ? createTemplateFile(tronTemplates[0]) : createNewFile()}>
+          <button class=${css.quickStartCard} data-id="landingDappStarterCard" onclick=${() => chooseTemplateFile()}>
             <div class=${css.quickStartIcon}>◎</div>
             <div class=${css.quickStartCardTitle}>Use TRON Template</div>
             <div class=${css.quickStartCardDesc}>Open the default TRON starter contract and begin from a known-safe example.</div>
@@ -2013,10 +2185,10 @@ export class LandingPage extends ViewPlugin {
             <div class=${css.quickStartCardTitle}>Open Contract Verification plugin</div>
             <span class=${css.resourceArrow}>→</span>
           </div>
-          <div class=${css.quickStartCardDesc}>Build a verification package, check TronScan status, and follow the manual submit checklist from the plugin.</div>
+          <div class=${css.quickStartCardDesc}>Download a flattened .sol, check TronScan status, and follow the exact compiler-settings checklist from the plugin.</div>
         </button>
         <div class=${css.verificationActions} aria-label="Contract verification links">
-          <a class=${css.statusPill} data-id="landingVerificationTabLookup" aria-label="Open verification lookup" target="_blank" rel="noopener noreferrer" href="https://tronscan.org/#/contracts/verify"><span>Manual submit on TronScan</span><span class=${css.statusBadge}>External</span></a>
+          <a class=${css.statusPill} data-id="landingVerificationTabLookup" aria-label="Open verification lookup" target="_blank" rel="noopener noreferrer" href="https://tronscan.org/#/contracts/verify"><span>Submit on Mainnet TronScan</span><span class=${css.statusBadge}>External</span></a>
           <button class=${css.statusPill} data-id="landingVerificationTabVerify" onclick=${() => openContractVerification()}><span>Verification checklist</span><span class=${css.statusBadge}>Plugin</span></button>
         </div>
       </section>
@@ -2031,7 +2203,7 @@ export class LandingPage extends ViewPlugin {
         <span data-id="landingAiActionNewWorkspace">Workspace action is available from Home quick actions.</span>
         <span data-id="landingAiActionCreateDapp">Create a DApp remains available from Home.</span>
 
-        <span data-id="landingParityTextFeedback">TronScan status query and Package checklist are verified here.</span>
+        <span data-id="landingParityTextFeedback">TronScan status query and flattened-source checklist are verified here.</span>
       </div>
     `
 
@@ -2080,7 +2252,7 @@ export class LandingPage extends ViewPlugin {
             <div class=${css.remix220Content}>
               <main class=${css.remix220Main} data-id="landingRemix220Main">
                 <section class=${css.heroPanel} data-id="landingRemix220Hero">
-                  <div class=${css.heroEyebrow}>${projectLogo} TRON IDE · v${packageJson.version}</div>
+                  <div class=${css.heroEyebrow}>${projectLogo} TRON IDE · v${packageJson.version} <button class=${css.heroNotesLink} data-id="landingReleaseNotesLink" title="View release notes" onclick=${() => openReleaseNotes()}>Release Notes</button> · <a class=${css.heroNotesLink} data-id="landingReportIssueLink" href="https://github.com/tronweb3/TronIDE/issues" target="_blank" rel="noopener noreferrer" title="Report a bug or request a feature on GitHub">Report an issue</a></div>
                   <h1 data-id="landingHeroTitle" class=${css.heroTitle}>TRON Native Smart Contract IDE</h1>
                   <p class=${css.heroSubtitle}>
                     Compile, deploy, debug, and manage TRON smart contracts from one workspace with JavaScript VM (Tron), Injected TronWeb, and TRON-focused examples.

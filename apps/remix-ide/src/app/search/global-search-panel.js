@@ -5,6 +5,7 @@ const csjs = require('csjs-inject')
 const {
   searchWorkspaceFiles,
   createWorkspaceReplacePreview,
+  collectSearchableFiles,
   DEFAULT_LIMITS,
   DEFAULT_INCLUDE_PATTERN,
   DEFAULT_EXCLUDE_PATTERN
@@ -670,8 +671,12 @@ class GlobalSearchPanel {
   }
 
   async collectWorkspaceFiles () {
-    const files = []
-    await this.collectFilesFromPath('', files)
+    // Shared UI-free collector (also used by the AI search_workspace tool);
+    // merge its returned skips/warnings into this panel's state exactly like
+    // the old inline walker mutated them.
+    const { files, skippedFiles, warnings } = await collectSearchableFiles(this.fileManager, DEFAULT_LIMITS)
+    this.skippedFiles += skippedFiles
+    this.warnings.push(...warnings)
     return files
   }
 
@@ -709,32 +714,6 @@ class GlobalSearchPanel {
     }
     this.lastReplaceUndo = []
     await this.runSearchNow()
-  }
-
-  async collectFilesFromPath (dir, files) {
-    if (files.length >= DEFAULT_LIMITS.maxFiles) return
-    const entries = await this.fileManager.readdir(dir || '/')
-    const names = Object.keys(entries || {}).sort()
-    for (const name of names) {
-      if (files.length >= DEFAULT_LIMITS.maxFiles) return
-      const entry = entries[name]
-      const path = entry.path || name
-      if (entry.isDirectory) {
-        await this.collectFilesFromPath(path, files)
-      } else if (this.isSearchableFile(path)) {
-        try {
-          const content = await this.fileManager.readFile(path)
-          files.push({ path, content })
-        } catch (error) {
-          this.skippedFiles++
-          this.warnings.push(`Skipped ${path}: ${error.message || error}`)
-        }
-      }
-    }
-  }
-
-  isSearchableFile (path) {
-    return /\.(sol|js|ts|tsx|json|md|txt|yul|move|rs|py|css|html)$/i.test(path)
   }
 
   async openResult (result) {

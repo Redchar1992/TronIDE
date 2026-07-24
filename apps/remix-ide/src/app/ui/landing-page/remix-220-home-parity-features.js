@@ -45,9 +45,9 @@ const REMIX_220_HOME_PARITY_FEATURES = {
     {
       id: 'topbar-productization',
       title: 'Top bar productization',
-      baseline: ['Workspace selector', 'Header layout controls', 'Connect GitHub', 'Connect Wallet', 'Sign In Beta', 'Notifications', 'Settings'],
+      baseline: ['Workspace selector', 'Header layout controls', 'Connect GitHub', 'Connect Wallet', 'Sign In Beta', 'Notifications'],
       status: 'required',
-      dataIds: ['landingAdvancedToolsPanel', 'landingAdvancedToolsToggle', 'landingLayoutControlsPanel', 'landingLayoutToggleSidePanel', 'landingLayoutToggleAiPanel', 'landingLayoutToggleTerminal', 'landingLayoutReset', 'headerWorkspaceMenu', 'headerWorkspaceDropdown', 'headerCreateWorkspace', 'headerBackupWorkspace', 'headerRestoreWorkspace', 'headerConnectLocalhost', 'headerLayoutToggles', 'headerToggleSidePanel', 'headerToggleBottomPanel', 'headerToggleAiPanel', 'headerGithubConnect', 'headerWalletConnect', 'headerNotificationsButton', 'headerNotificationsPanel', 'headerSettingsButton']
+      dataIds: ['landingAdvancedToolsPanel', 'landingAdvancedToolsToggle', 'landingLayoutControlsPanel', 'landingLayoutToggleSidePanel', 'landingLayoutToggleAiPanel', 'landingLayoutToggleTerminal', 'landingLayoutReset', 'headerWorkspaceMenu', 'headerWorkspaceDropdown', 'headerCreateWorkspace', 'headerBackupWorkspace', 'headerRestoreWorkspace', 'headerConnectLocalhost', 'headerLayoutToggles', 'headerToggleSidePanel', 'headerToggleBottomPanel', 'headerToggleAiPanel', 'headerGithubConnect', 'headerWalletConnect', 'headerNotificationsButton', 'headerNotificationsPanel']
     },
     {
       id: 'status-entry-replacements',

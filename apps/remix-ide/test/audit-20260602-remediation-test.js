@@ -118,19 +118,19 @@ test('Production dependency audit overrides are explicit and release-scoped', fu
   const overrides = rootPackage.pnpm && rootPackage.pnpm.overrides ? rootPackage.pnpm.overrides : {}
   const patchedDependencies = rootPackage.pnpm && rootPackage.pnpm.patchedDependencies ? rootPackage.pnpm.patchedDependencies : {}
   const lockfile = readRoot('pnpm-lock.yaml')
-  const requestPatch = readRoot('patches/request@2.88.2.patch')
 
   t.notOk(Object.prototype.hasOwnProperty.call(rootPackage.dependencies, 'eth-lib'), 'unused eth-lib direct production dependency is removed')
   t.equal(overrides['web3-bzz'], 'link:libs/web3-bzz-disabled', 'unused web3.bzz Swarm module is replaced by a local disabled adapter')
   t.equal(overrides['web3-eth-accounts>uuid'], '11.1.1', 'web3 account UUID generation uses a maintained uuid release')
   t.equal(overrides['uuid@8.3.2'], '11.1.1', 'transitive uuid 8.x resolutions use a maintained uuid release')
   t.equal(overrides['request>uuid'], '11.1.1', 'legacy request UUID generation uses a maintained uuid release')
-  t.equal(patchedDependencies['request@2.88.2'], 'patches/request@2.88.2.patch', 'legacy request imports are patched for uuid 11 compatibility')
-  t.ok(/require\('uuid'\)\.v4/.test(requestPatch), 'request patch uses the uuid 11 CommonJS entry point')
-  t.notOk(/\n  uuid@(3|8)\.\d+\.\d+:\n/.test(lockfile), 'lockfile no longer has vulnerable uuid 3.x/8.x package entries')
-  t.notOk(/\n  uuid@(3|8)\.\d+\.\d+: \{\}/.test(lockfile), 'lockfile no longer has vulnerable uuid 3.x/8.x snapshots')
+  t.notOk(Object.prototype.hasOwnProperty.call(patchedDependencies, 'request@2.88.2'), 'obsolete request compatibility patch is removed')
+  t.notOk(fs.existsSync(path.join(root, 'patches/request@2.88.2.patch')), 'removed request package no longer carries a dead patch file')
+  t.notOk(/\n {2}request@2\.88\.2:\n/.test(lockfile), 'deprecated request package is absent from the lockfile')
+  t.notOk(/\n {2}uuid@(3|8)\.\d+\.\d+:\n/.test(lockfile), 'lockfile no longer has vulnerable uuid 3.x/8.x package entries')
+  t.notOk(/\n {2}uuid@(3|8)\.\d+\.\d+: \{\}/.test(lockfile), 'lockfile no longer has vulnerable uuid 3.x/8.x snapshots')
   t.equal(overrides['web3-core-subscriptions'], 'link:libs/web3-core-subscriptions-patched', 'web3 subscription prototype-pollution advisory is patched locally')
-  t.equal(overrides['elliptic'], 'link:libs/elliptic-patched', 'elliptic RFC6979 nonce advisory is patched locally')
+  t.equal(overrides.elliptic, 'link:libs/elliptic-patched', 'elliptic RFC6979 nonce advisory is patched locally')
 
   const bzzPackage = JSON.parse(readRoot('libs/web3-bzz-disabled/package.json'))
   const bzzSource = readRoot('libs/web3-bzz-disabled/index.js')

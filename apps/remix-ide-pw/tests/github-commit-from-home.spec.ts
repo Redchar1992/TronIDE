@@ -14,9 +14,16 @@ test.describe('GitHub commit from the Home tab', () => {
     await dismissWelcomeModal(page)
     await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
 
-    // Open a file in the editor (the TRON DApp template card creates + opens one).
+    // Open a file in the editor. The TRON template card now opens a chooser
+    // (template picker) rather than directly seeding a file, so pick a template
+    // and confirm to seed + open it — mirroring TC-TPL-003.
     await page.locator('[data-id="landingDappStarterCard"]').first().click({ timeout: 15_000 })
-    await page.waitForTimeout(2500)
+    const templateSelect = page.locator('select[data-id="landingTemplateSelect"]')
+    await templateSelect.waitFor({ state: 'visible', timeout: 10_000 })
+    await templateSelect.selectOption('trc721-minimal')
+    await page.locator('#modal-footer-ok').click()
+    await page.locator('remix-tab[id$="TRC721Minimal.sol"]').waitFor({ state: 'visible', timeout: 15_000 })
+    await page.locator('#input').waitFor({ timeout: 10_000 })
     // editor now holds a file
     const hasFile = await page.evaluate(() => {
       const el = document.getElementById('input') as any

@@ -53,6 +53,10 @@ class SettingsUI {
 
     this._onTransactionExecuted = (error, from, to, data, lookupOnly, txResult) => {
       if (this._destroyed) return
+      // Failures now reach this event too (the recorder needs them to stamp
+      // reverted steps). Keep the pre-existing behavior for this panel: a
+      // failed/rejected tx leaves the value fields as the user typed them.
+      if (error) return
       if (!lookupOnly && this.el) {
         this.el.querySelector('#value').value = 0
         this.el.querySelector('#tokenId').value = 0
@@ -61,7 +65,6 @@ class SettingsUI {
         this.setFieldValidationError('tokenId')
         this.setFieldValidationError('tokenValue')
       }
-      if (error) return
       this.updateAccountBalances()
     }
     this._registerBlockchainEvent('transactionExecuted', this._onTransactionExecuted)

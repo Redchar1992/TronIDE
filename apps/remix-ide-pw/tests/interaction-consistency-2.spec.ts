@@ -167,8 +167,13 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
     await expect(page.locator('[data-id="sidePanelSwapitTitle"]')).toContainText(/contract verification/i, { timeout: 15_000 })
   })
 
-  test('TC-IX-PNL-004: Reset layout restores the side, bottom and AI panels', async ({ page }) => {
+  test('TC-IX-PNL-004: Reset layout restores panels but leaves the workspace unchanged', async ({ page }) => {
     await bootstrap(page)
+    // Be on a NON-default workspace so "reset does not switch workspace" is a
+    // meaningful assertion (the Reset toast used to wrongly say "default
+    // workspace view", implying a workspace switch that never happens).
+    await createWorkspace(page, 'ix-layout-ws')
+
     const sidePanel = page.locator('#side-panel')
     const aiVisible = () => page.evaluate(() => {
       const el = document.getElementById('ai-panel')
@@ -187,9 +192,11 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
     if ((await toggle.getAttribute('aria-expanded')) === 'false') await toggle.click()
     await page.locator('[data-id="landingLayoutReset"]').click()
 
-    // All panels are restored to their default visible state.
+    // All panels are restored to their default visible state…
     await expect(sidePanel).toBeVisible({ timeout: 10_000 })
     await expect.poll(aiVisible).toBe(true)
+    // …and the active workspace is NOT changed by a layout reset.
+    await expect(page.locator('select[data-id="workspacesSelect"]')).toHaveValue('ix-layout-ws')
   })
 
   test('TC-IX-HOME-002: GitHub token Connect/Disconnect text strictly tracks the real state', async ({ page }) => {
@@ -207,7 +214,7 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
 
     // Disconnected baseline: Connect reads "Connect token", no Disconnect button.
     const connectBtn = page.locator('[data-id="landingGithubTokenConnect"]')
-    await expect(connectBtn).toHaveText('Connect token')
+    await expect(connectBtn).toHaveText('Connect token (PAT)')
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toHaveCount(0)
 
     // Connect: enter a (mock-validated) token.
@@ -218,17 +225,19 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
     await page.locator('#modal-footer-ok').click()
 
     // Connected: Disconnect appears, Connect flips to "Reconnect token", the
-    // login surfaces, and the session token is stored.
+    // login surfaces. The token is scoped to this browser tab so a refresh keeps
+    // the connection without creating a persistent localStorage copy.
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toBeVisible({ timeout: 10_000 })
     await expect(connectBtn).toHaveText('Reconnect token')
     await expect(panel).toContainText('tron-tester')
     expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.token'))).toBe('ghp_faketoken_for_test')
+    expect(await page.evaluate(() => window.localStorage.getItem('tronide.github.token'))).toBeNull()
 
     // Disconnect: state reverts exactly — Disconnect gone, Connect back to
-    // "Connect token", token cleared from sessionStorage (M2: text == state).
+    // "Connect token" (M2: text == state). Disconnect clears the tab copy.
     await page.locator('[data-id="landingGithubTokenDisconnect"]').click()
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toHaveCount(0, { timeout: 10_000 })
-    await expect(connectBtn).toHaveText('Connect token')
+    await expect(connectBtn).toHaveText('Connect token (PAT)')
     expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.token'))).toBeNull()
   })
 

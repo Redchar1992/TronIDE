@@ -20,7 +20,25 @@
 'use strict'
 
 var async = require('async')
-var swarmgw = require('swarmgw')()
+
+var SWARM_RAW_UPLOAD_URL = 'https://swarm-gateways.net/bzz-raw:/'
+
+function putSwarmContent (content, cb) {
+  var controller = new AbortController()
+  var timeout = setTimeout(function () { controller.abort() }, 30000)
+  fetch(SWARM_RAW_UPLOAD_URL, {
+    method: 'POST',
+    body: content,
+    redirect: 'error',
+    signal: controller.signal
+  }).then(function (response) {
+    if (!response.ok) throw new Error('Swarm upload failed with HTTP ' + response.status)
+    return response.text()
+  }).then(function (hash) {
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('Swarm gateway returned an invalid hash')
+    cb(null, hash)
+  }).catch(cb).finally(function () { clearTimeout(timeout) })
+}
 
 module.exports = (contract, fileManager, cb, swarmVerifiedPublishCallBack) => {
   // gather list of files to publish
@@ -116,7 +134,7 @@ module.exports = (contract, fileManager, cb, swarmVerifiedPublishCallBack) => {
 }
 
 function swarmVerifiedPublish (content, expectedHash, cb) {
-  swarmgw.put(content, function (err, ret) {
+  putSwarmContent(content, function (err, ret) {
     if (err) {
       cb(err)
     } else if (expectedHash && ret !== expectedHash) {

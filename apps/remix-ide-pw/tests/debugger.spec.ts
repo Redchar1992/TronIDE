@@ -1,6 +1,36 @@
 import { test, expect, Page } from '@playwright/test'
 import { dismissWelcomeModal } from './helpers'
 
+const INJECTED_ACCOUNT = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb'
+const NILE_GENESIS = '0000000000000000d698d4192c56cb6be724a558448e2684802de4d6cd8690dc'
+const INJECTED_DEBUG_FIXTURE = `
+(() => {
+  const ACCOUNT = '${INJECTED_ACCOUNT}'
+  const HOST = 'https://nile.trongrid.io'
+  const trx = new Proxy({
+    getBlock: async () => ({ blockID: '${NILE_GENESIS}', block_header: { raw_data: {} } }),
+    getCurrentBlock: async () => ({ blockID: '${NILE_GENESIS}', block_header: { raw_data: { number: 1, timestamp: 1 } } }),
+    getBalance: async () => 0,
+    getAccount: async () => ({ balance: 0 })
+  }, { get (target, property) { return property in target ? target[property] : (async () => undefined) } })
+  window.tronWeb = new Proxy({
+    defaultAddress: { base58: ACCOUNT, hex: '410000000000000000000000000000000000000000' },
+    fullNode: { host: HOST }, solidityNode: { host: HOST }, eventServer: { host: HOST },
+    setHeader: () => {}, trx,
+    transactionBuilder: new Proxy({}, { get () { return async () => ({}) } }),
+    address: { toHex: (address) => address, fromHex: (address) => address },
+    isAddress: () => true
+  }, { get (target, property) { return property in target ? target[property] : (() => undefined) } })
+  window.tronLink = {
+    ready: true,
+    tronWeb: window.tronWeb,
+    request: async () => ({ code: 200, message: 'The site is already in the whitelist' }),
+    on: () => {},
+    removeListener: () => {}
+  }
+})()
+`
+
 // Debugger coverage over VM (Tron) transactions:
 //   TC-DBG-001 — debug a successful tx: trace captured, steppable.
 //   TC-DBG-002 — debug a FAILING (revert) tx: does not crash, trace + failing-tx
@@ -196,6 +226,81 @@ test.describe('Debugger over a VM (Tron) transaction', () => {
     await expect(page.locator('#side-panel')).toContainText(/unable to retrieve|not found|invalid/i, { timeout: 30_000 })
     await expect(txInput).toBeVisible()
     expect(pageErrors).toEqual([])
+  })
+
+  test('TC-DBG-010: Injected TronWeb explains missing VM traces instead of opening a blank debugger', { tag: '@gate' }, async ({ page }) => {
+    const pageErrors: string[] = []
+    page.on('pageerror', (err) => pageErrors.push(String(err)))
+    await page.addInitScript(INJECTED_DEBUG_FIXTURE)
+    await page.goto('/')
+    await dismissWelcomeModal(page)
+    await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+
+    await page.locator('#icon-panel div[plugin="udapp"]').click()
+    const environment = page.locator('select#selectExEnvOptions')
+    await environment.waitFor({ timeout: 15_000 })
+    await environment.selectOption('injected')
+    await expect(environment).toHaveValue('injected', { timeout: 15_000 })
+
+    await page.locator('#icon-panel div[plugin="pluginManager"]').click()
+    await page.locator('[data-id="pluginManagerComponentSearchInput"]').fill('debugger')
+    await page.locator('[data-id="pluginManagerComponentActivateButtondebugger"]').click()
+    const debuggerIcon = page.locator('#icon-panel div[plugin="debugger"]')
+    await expect(debuggerIcon).toBeVisible({ timeout: 15_000 })
+    await debuggerIcon.click()
+
+    const txInput = page.locator('[data-id="debuggerTransactionInput"]')
+    const startButton = page.locator('[data-id="debuggerTransactionStartButton"]')
+    await txInput.fill('0x' + 'ab'.repeat(32))
+    await startButton.click()
+
+    const error = page.locator('.validationError')
+    await expect(error).toContainText('Step debugging is unavailable for Injected TronWeb')
+    await expect(error).toContainText('TronLink does not expose transaction VM traces')
+    await expect(startButton).toContainText('Start debugging')
+    await expect(txInput).toBeEnabled()
+    await expect(page.locator('[data-id="stepdetail"]')).toHaveCount(0)
+    expect(pageErrors).toEqual([])
+  })
+
+  test('TC-DBG-011: a VM transaction remains debuggable after switching to TronLink and back', { tag: '@gate' }, async ({ page }) => {
+    await page.addInitScript(INJECTED_DEBUG_FIXTURE)
+    await compileAndOpenUdapp(page, '1_Storage.sol', 'Storage')
+    await page.locator('button[data-id="Deploy - transact (not payable)"]', { hasText: 'Deploy' }).click()
+
+    const instance = page.locator('.instance, *[data-id^="instance"]').first()
+    await expect(instance).toBeVisible({ timeout: 30_000 })
+    await instance.locator('[data-id="universalDappUiTitleExpander"]').click()
+    await page.locator('#runTabView input[title="uint256 num"]').fill('42')
+    await instance.locator('button[title="store - transact (not payable)"]', { hasText: 'store' }).click()
+
+    const debugButtons = page.locator('*[data-shared="txLoggerDebugButton"]')
+    await expect(debugButtons).toHaveCount(2, { timeout: 30_000 })
+
+    // Match the reported sequence exactly: debug successfully in VM first,
+    // switch to TronLink and retry the same terminal transaction, then return
+    // to VM and retry it once more.
+    await debugButtons.last().click()
+    await expectDebuggerReady(page)
+    await page.locator('#icon-panel div[plugin="udapp"]').click()
+
+    const environment = page.locator('select#selectExEnvOptions')
+    await environment.selectOption('injected')
+    await expect(environment).toHaveValue('injected', { timeout: 15_000 })
+
+    await debugButtons.last().click()
+    const mismatchDialog = page.locator('[data-id="modalDialogModalBody"]')
+    await expect(mismatchDialog).toContainText('This transaction was created in JavaScript VM (Tron)')
+    await expect(mismatchDialog).toContainText('Switch back to JavaScript VM (Tron)')
+    await page.locator('#modal-footer-ok').click()
+
+    await environment.selectOption('vm-tron')
+    await expect(environment).toHaveValue('vm-tron', { timeout: 15_000 })
+
+    // Returning to the same VM fork must reuse its simulator instead of
+    // replacing it, otherwise this terminal hash loses its receipt and trace.
+    await debugButtons.last().click()
+    await expectDebuggerReady(page)
   })
 
   test('TC-DBG-008: a long trace (big loop) stays steppable — UI does not freeze, steps do not drop', async ({ page }) => {

@@ -22,21 +22,23 @@ var modalDialogCustom
 if (typeof window !== 'undefined') {
   modalDialogCustom = require('../app/ui/modal-dialog-custom')
 }
+// Tab-session GitHub connect token used to authenticate
+// gist loads; tokens are never read from web storage or config.
+var githubAuth = require('./github-auth')
 var githubGistSecurity = loadGithubGistSecurity()
+var normalizeGistId = require('./normalize-gist-id')
 
-// Read the user's configured gist access token (the same `settings/gist-access-token` key the
-// Settings tab and the Home/Header GitHub connect flow write). Authenticated GitHub requests get a
-// far higher rate limit than anonymous ones, which is what was causing "API rate limit exceeded"
-// when loading gists. Returns '' when no token is configured so we transparently fall back to anonymous.
+// Read an access token to authenticate gist loads (authenticated GitHub requests
+// get a far higher rate limit than anonymous, which was causing "API rate limit
+// exceeded"). Uses only the in-memory GitHub connect token (lib/github-auth, set
+// by the Home/Header "Connect GitHub" flow) — the legacy Settings-tab PAT channel
+// is retired. Returns '' when not connected so we transparently load the gist
+// anonymously.
 function getGistAccessToken () {
   try {
-    const registry = require('../global/registry')
-    const config = registry && registry.get && registry.get('config') && registry.get('config').api
-    if (config && typeof config.get === 'function') {
-      return String(config.get('settings/gist-access-token') || '').trim()
-    }
+    return String(githubAuth.getToken() || '').trim()
   } catch (error) {
-    console.debug('[gistHandler] gist access token unavailable; loading gist anonymously', error)
+    console.debug('[gistHandler] in-memory github token unavailable; loading gist anonymously', error)
   }
   return ''
 }
@@ -117,7 +119,7 @@ function GistHandler (_window) {
       })
       return loadingFromGist
     } else {
-      gistId = params.gist
+      gistId = getGistId(params.gist)
       loadingFromGist = !!gistId
     }
     if (loadingFromGist) {
@@ -126,24 +128,43 @@ function GistHandler (_window) {
     return loadingFromGist
   }
 
-  // Extract a GitHub gist id from a raw string that may be either a bare id or a full gist URL.
-  // Real gist ids are hex and 20 (legacy) to 32 (current) characters long, so we bound the match to
-  // 16-40 hex chars: long enough to reject short junk like "aaaaaaaa" (which previously slipped
-  // through the old `{8,}` rule and only surfaced as a confusing fetch error), yet wide enough to
-  // still pick the id out of a URL such as https://gist.github.com/<user>/<id> without misfiring on
-  // short path segments. Returns null when nothing id-shaped is found so the caller can show a clear
-  // "valid Gist ID or URL" message instead of letting an invalid id fail later in fetchGist.
+  // Accept only a bare id or a canonical gist.github.com URL. Secret redaction
+  // happens first so token-like input can never be reinterpreted as a gist id.
   function getGistId (str) {
     const redactedInput = githubGistSecurity.redactGitHubSecrets(str)
-    var idr = /[0-9A-Fa-f]{16,40}/
-    var match = idr.exec(redactedInput)
-    return match ? match[0] : null
+    return normalizeGistId(redactedInput)
   }
 
   this.loadFromGist = (params, fileManager) => {
     const self = this
     return self.handleLoad(params, function (gistId) {
-      fetchGist(gistId).then((data) => {
+      // Bind the import before starting either the gist API request or any raw
+      // content backfill. A checkout/workspace switch increments the provider
+      // generation, so the original context will reject a late batch write
+      // instead of materialising source-branch files in the new branch.
+      let mutationContext
+      let capturedContext
+      try {
+        if (typeof fileManager.captureWorkspaceMutationContext === 'function') {
+          capturedContext = fileManager.captureWorkspaceMutationContext('/')
+        } else {
+          const provider = fileManager.getProvider && fileManager.getProvider('workspace')
+          if (!provider || typeof provider.captureMutationContext !== 'function') {
+            throw new Error('The active workspace could not be bound to the gist import.')
+          }
+          capturedContext = provider.captureMutationContext()
+        }
+      } catch (error) {
+        const safeError = githubGistSecurity.redactGitHubSecrets(String(error && error.message ? error.message : error))
+        modalDialogCustom.alert('Gist load error', safeError)
+        return
+      }
+
+      Promise.resolve(capturedContext).then((context) => {
+        if (!context) throw new Error('The active workspace could not be bound to the gist import.')
+        mutationContext = context
+        return fetchGist(gistId)
+      }).then((data) => {
         if (!data || !data.files) {
           const safeError = githubGistSecurity.redactGitHubSecrets(String(data && data.message ? data.message : 'Gist response did not contain files'))
           modalDialogCustom.alert('Gist load error', safeError)
@@ -191,7 +212,7 @@ function GistHandler (_window) {
             modalDialogCustom.alert(
               'Gist load error',
               'Could not load the content of the following gist file(s): ' + unresolved.join(', ') +
-              '. They may be too large, or GitHub could not be reached (a rate limit applies to anonymous requests — add a gist access token in the Settings tab to raise it).'
+              '. They may be too large, or GitHub could not be reached (anonymous requests are rate-limited — connect GitHub to raise the limit).'
             )
           }
           const obj = {}
@@ -214,7 +235,7 @@ function GistHandler (_window) {
           } else {
             modalDialogCustom.alert('Gist load error', errorLoadingFile.message || errorLoadingFile)
           }
-        })
+        }, mutationContext)
       }).catch((error) => {
         const safeError = githubGistSecurity.redactGitHubSecrets(String(error && error.message ? error.message : error))
         modalDialogCustom.alert('Gist load error', safeError)

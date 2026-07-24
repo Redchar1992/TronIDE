@@ -49,7 +49,7 @@ async function clickInPopup (browser, namePattern, timeoutMs) {
 
 async function connectViaHeader (page) {
   await page.locator('[data-id="headerWalletConnect"]').click()
-  await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 30000 })
+  await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 30000 })
 }
 
 ;(async () => {

@@ -45,12 +45,15 @@ test.describe('Interaction consistency (R-IX-1)', () => {
     await expect(page.locator('[data-id="landingPluginToggleAnalyzers"]')).toBeVisible({ timeout: 15_000 })
     await expect(analyzersCard).toContainText('Deactivate')
 
-    // Search TRON templates activates pluginManager (may already be active —
-    // the assertion is only that the card reflects the active state afterwards).
-    const cookbookCard = page.locator('[data-id="landingPluginCookbook"]')
-    await cookbookCard.getByText('Search TRON templates').click()
-    await expect(page.locator('[data-id="landingPluginToggleCookbook"]')).toBeVisible({ timeout: 15_000 })
-    await expect(cookbookCard).toContainText('Deactivate')
+    // The "New TRON Workspace" card is not a plugin (no ON badge or toggle):
+    // "New workspace" opens the File Explorer's Create Workspace dialog (with
+    // the TRON template dropdown) — a NEW workspace, distinct from "Use TRON
+    // Template" in Start building which adds a template file to the current one.
+    const newWsCard = page.locator('[data-id="landingPluginCookbook"]')
+    await expect(newWsCard).not.toContainText('Deactivate')
+    await expect(page.locator('[data-id="landingPluginToggleCookbook"]')).toHaveCount(0)
+    await newWsCard.click() // the card button fires createWorkspaceFromHome
+    await expect(page.locator('input[data-id="modalDialogCustomPromptTextCreate"]')).toBeVisible({ timeout: 15_000 })
   })
 
   test('TC-IX-PLG-004: activating from Plugin Manager updates the Home card live', async ({ page }) => {

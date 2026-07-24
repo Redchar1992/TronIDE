@@ -2,7 +2,7 @@ import { test, expect, Page } from '@playwright/test'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { dismissWelcomeModal } from './helpers'
+import { blockCompilerSources, dismissWelcomeModal } from './helpers'
 
 // Extra compiler coverage:
 //   TC-CMP-003 — a syntax error is reported with a location, no crash.
@@ -164,9 +164,96 @@ test.describe('Solidity compiler (extra)', () => {
     await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeEnabled()
   })
 
-  // TC-CMP-VER-004 (v2.3.0 backport of v2.3.2 Q2-c): selecting a 0.4.x build in
-  // the full dropdown warns up front on Chromium (the asm.js build crashes the
-  // compiler) but does not block the selection.
+  test('TC-CMP-VER-001: recommended TVM compiler versions are offered and selectable', async ({ page }) => {
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+
+    // The recommended row renders once the Tron solc list has loaded, with at
+    // least the latest 0.8.x line as a quick-pick.
+    const row = page.locator('[data-id="compilerRecommendedVersions"]')
+    await expect(row).toBeVisible({ timeout: 30_000 })
+    const picks = row.locator('button[data-id^="compilerRecommendedVersion-"]')
+    await expect.poll(() => picks.count(), { timeout: 15_000 }).toBeGreaterThan(0)
+    const labels = await picks.allInnerTexts()
+    expect(labels.some((t) => /^0\.8\./.test(t.trim()))).toBeTruthy()
+
+    // Clicking a recommended version sets the compiler selector to that build
+    // (state updates synchronously; the soljson download proceeds in the
+    // background — the UX contract under test is the one-click selection).
+    const target = picks.filter({ hasText: /^0\.8\./ }).first()
+    const version = (await target.innerText()).trim()
+    await target.click()
+    await expect.poll(async () => await page.locator('#versionSelector').inputValue(), { timeout: 10_000 })
+      .toContain(version)
+  })
+
+  // TC-CMP-VER-002 (v2.3.2): the compilation event carries the REAL solc
+  // version, not the literal 'soljson' the upstream code hardcoded.
+  test('TC-CMP-VER-002: __last.languageversion holds the real solc version after compiling', async ({ page }) => {
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+    await page.locator('*[data-id="compilerContainerCompileBtn"]').click()
+    await expect(page.locator('*[data-id="compiledContracts"]')).toContainText('Storage', { timeout: 30_000 })
+
+    const langVersion = await page.evaluate(() => {
+      const art = (window as any).__compilersArtefacts
+      return (art && art.__last && art.__last.languageversion) || ''
+    })
+    // the real solc version, e.g. "0.8.20+commit.…", not the literal 'soljson'
+    expect(langVersion).toMatch(/^\d+\.\d+\.\d+/)
+    expect(langVersion).not.toBe('soljson')
+  })
+
+  // TC-CMP-VER-003 (v2.3.2 Q2-b): the version list being unreachable must not
+  // throw uncaught; the panel degrades to the bundled builtin compiler.
+  test('TC-CMP-VER-003: version list unreachable degrades to builtin with no uncaught error', async ({ page }) => {
+    const pageErrors: string[] = []
+    page.on('pageerror', (e) => pageErrors.push(String(e)))
+    await page.route('**/list.json*', (route) => route.abort())
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+    await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeVisible({ timeout: 15_000 })
+    await page.waitForTimeout(3_000)
+
+    // the degrade-gracefully fix: the same-origin builtin compiler is no longer rejected as
+    // a disallowed origin, so the version-load path does not throw uncaught
+    expect(pageErrors.filter((e) => /origin is not allowed|not allowed/i.test(e))).toEqual([])
+    expect(pageErrors).toEqual([])
+
+    // the panel degraded to the builtin compiler and stays operable
+    const version = await page.locator('#versionSelector').inputValue().catch(() => '')
+    expect(version === '' || /builtin/i.test(version) || /0\.8/.test(version)).toBeTruthy()
+    await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeEnabled()
+  })
+
+  // TC-CMP-VER-005 (v2.3.2): when the version list cannot be fetched (offline /
+  // blocked / timed out) the panel must INFORM the user it is falling back to
+  // the bundled builtin compiler, not degrade silently (silent-failure M4).
+  // VER-003 only asserted no-crash; this closes the "user is informed" gap.
+  test('TC-CMP-VER-005: version-list fetch failure informs the user it is using the builtin compiler', async ({ page }) => {
+    const pageErrors: string[] = []
+    page.on('pageerror', (e) => pageErrors.push(String(e)))
+    // make the list.json fetch fail (the offline / blocked scenario)
+    await page.route('**/list.json*', (route) => route.abort())
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+
+    // the fetch-failure path surfaces a toast telling the user it could not
+    // fetch the version list and is using the built-in compiler
+    await expect(
+      page.locator('[data-shared="tooltipPopup"]')
+        .filter({ hasText: /could not fetch the compiler version list|using the built-in compiler/i })
+        .first()
+    ).toBeVisible({ timeout: 30_000 })
+
+    // and it still degrades gracefully — no uncaught error, button operable
+    expect(pageErrors).toEqual([])
+    await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeEnabled()
+  })
+
+  // TC-CMP-VER-004 (v2.3.2 Q2-c): selecting a 0.4.x build in the full dropdown
+  // warns up front on Chromium (the asm.js build crashes the compiler), but
+  // does not block the selection.
   test('TC-CMP-VER-004: selecting 0.4.x warns on Chromium without blocking', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'the warning targets Chromium-based engines')
     await openDefaultWorkspace(page)
@@ -187,5 +274,91 @@ test.describe('Solidity compiler (extra)', () => {
       .toBeVisible({ timeout: 10_000 })
     // selection is NOT blocked — the selector now shows the 0.4 version
     await expect.poll(async () => await selector.inputValue(), { timeout: 5_000 }).toContain('0.4.')
+  })
+
+  // TC-CMP-VER-006 (v2.3.2): the version list loads but the compiler BINARY
+  // download fails (slow/blocked CDN — the mainland-China github.io case).
+  // The panel must inform the user and auto-fall back to the bundled builtin
+  // compiler, and the builtin must actually COMPILE through the worker: the
+  // worker-side URL re-validation used to reject the same-origin builtin
+  // (`window` does not exist in a worker), so the fallback target itself was
+  // broken — asserting a real compile pins the fix.
+  test('TC-CMP-VER-006: compiler binary download failure falls back to builtin and still compiles', async ({ page }) => {
+    const pageErrors: string[] = []
+    page.on('pageerror', (e) => pageErrors.push(String(e)))
+    // deterministic version list (no live-network dependency)…
+    await page.route('**/list.json*', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ builds: [{ path: 'soljson-v0.8.6+commit.0e36fba0.js', version: '0.8.6', build: 'commit.0e36fba0', longVersion: '0.8.6+commit.0e36fba0' }] })
+    }))
+    // …then kill the remote binary download itself (builtin stays reachable)
+    await page.route(/tronprotocol\.github\.io\/solc-bin\/wasm\/soljson-/, (route) => route.abort())
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+
+    // the fallback informs the user…
+    await expect(
+      page.locator('[data-shared="tooltipPopup"]').filter({ hasText: /switched to the built-in compiler/i }).first()
+    ).toBeVisible({ timeout: 30_000 })
+    // …and selects the builtin build
+    await expect.poll(async () => await page.locator('#versionSelector').inputValue(), { timeout: 10_000 }).toBe('builtin')
+
+    // the builtin compiler really works end-to-end through the worker
+    await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeEnabled({ timeout: 30_000 })
+    await page.locator('*[data-id="compilerContainerCompileBtn"]').click()
+    await expect(page.locator('*[data-id="compiledContracts"]')).toContainText('Storage', { timeout: 30_000 })
+    expect(pageErrors).toEqual([])
+  })
+
+  // TC-CMP-VER-008 (v2.3.2): the builtin dropdown label must state the version
+  // the BUNDLED binary actually reports. The asset was swapped (0.8.6 → 0.8.20)
+  // while every label stayed "0.8.6" — banner, toast and pragma matching all
+  // described a compiler that wasn't there. Comparing label and binary at
+  // runtime makes any future asset swap fail HERE instead of going stale.
+  test('TC-CMP-VER-008: builtin label matches the version the bundled compiler reports', { tag: '@gate' }, async ({ page }) => {
+    await page.route(/tronprotocol\.github\.io\/solc-bin\/wasm\/soljson-/, (route) => route.abort())
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+
+    // the blocked binary download lands the panel on the builtin compiler
+    const selector = page.locator('#versionSelector')
+    await expect.poll(async () => await selector.inputValue(), { timeout: 45_000 }).toBe('builtin')
+    const label = await selector.locator('option[value="builtin"]').innerText()
+    const labelVersion = (label.match(/(\d+\.\d+\.\d+)/) || [])[1] || ''
+    expect(labelVersion, `builtin label "${label}" must carry a version`).not.toBe('')
+
+    // compile with the builtin and compare what the binary itself reports
+    await expect(page.locator('*[data-id="compilerContainerCompileBtn"]')).toBeEnabled({ timeout: 30_000 })
+    await page.locator('*[data-id="compilerContainerCompileBtn"]').click()
+    await expect(page.locator('*[data-id="compiledContracts"]')).toContainText('Storage', { timeout: 60_000 })
+    const reported = await page.evaluate(() => {
+      const a = (window as any).__compilersArtefacts
+      return (a && a.__last && a.__last.languageversion) || ''
+    })
+    expect(
+      reported.startsWith(labelVersion + '+') || reported === labelVersion,
+      `label says ${labelVersion} but the bundled binary reports ${reported}`
+    ).toBeTruthy()
+  })
+
+  // TC-CMP-VER-007 (v2.3.2): when the BUILTIN compiler itself cannot load
+  // (fully offline: version list, remote binaries and the bundled soljson all
+  // unreachable) the failure must surface once — the auto-fallback must not
+  // advertise switching to the compiler that just failed, nor retry-loop.
+  test('TC-CMP-VER-007: builtin compiler load failure does not fall back in a loop', async ({ page }) => {
+    const pageErrors: string[] = []
+    page.on('pageerror', (e) => pageErrors.push(String(e)))
+    await blockCompilerSources(page)
+    await openDefaultWorkspace(page)
+    await page.locator('#icon-panel div[plugin="solidity"]').click()
+
+    // the builtin load failure is surfaced in the panel…
+    await expect(page.locator('#compileTabView'))
+      .toContainText(/Worker error|Failed to load compiler|timed out/i, { timeout: 45_000 })
+    // …without the fallback toast (builtin IS the fallback — switching to it
+    // again would loop) and without uncaught errors
+    await expect(page.locator('[data-shared="tooltipPopup"]').filter({ hasText: /switched to the built-in compiler/i })).toHaveCount(0)
+    expect(pageErrors).toEqual([])
   })
 })

@@ -28,6 +28,7 @@ const ace = require('brace')
 
 const globalRegistry = require('../../global/registry')
 const SourceHighlighters = require('./SourceHighlighters')
+const addTooltip = require('../ui/tooltip')
 
 const Range = ace.acequire('ace/range').Range
 require('brace/ext/language_tools')
@@ -42,6 +43,13 @@ require('brace/mode/javascript')
 require('brace/mode/python')
 require('brace/mode/json')
 require('brace/mode/rust')
+// Web-artifact modes: dapp frontends live in the workspace too (the AI panel
+// can generate them), and an unregistered mode silently renders as plain text.
+// brace's html mode embeds the css/javascript sub-modes for <style>/<script>.
+require('brace/mode/html')
+require('brace/mode/css')
+require('brace/mode/markdown')
+require('brace/mode/typescript')
 require('brace/theme/chrome') // for all light themes
 require('brace/theme/chaos') // for all dark themes
 require('../../assets/js/editor/darkTheme') // a custom one for remix 'Dark' theme
@@ -112,7 +120,12 @@ class Editor extends Plugin {
       txt: 'ace/mode/text',
       json: 'ace/mode/json',
       abi: 'ace/mode/json',
-      rs: 'ace/mode/rust'
+      rs: 'ace/mode/rust',
+      html: 'ace/mode/html',
+      htm: 'ace/mode/html',
+      css: 'ace/mode/css',
+      md: 'ace/mode/markdown',
+      ts: 'ace/mode/typescript'
     }
 
     // Editor Setup
@@ -155,6 +168,24 @@ class Editor extends Plugin {
       readOnly: true
     })
 
+    // AI: explain the current contract (Cmd/Ctrl-Alt-E). Sends the whole file
+    // to the AI panel's chat via aiPanel.explainContract.
+    this.editor.commands.addCommand({
+      name: 'aiExplainContract',
+      bindKey: { win: 'Ctrl-Alt-E', mac: 'Command-Alt-E' },
+      exec: () => { this.aiExplainContract() },
+      readOnly: true
+    })
+
+    // AI: inline `//` request (Cmd/Ctrl-I). If the current line is a `// ...`
+    // comment, treat its text as an instruction, send it + surrounding context
+    // to the LLM, and insert the returned code on the next line.
+    this.editor.commands.addCommand({
+      name: 'aiInlineRequest',
+      bindKey: { win: 'Ctrl-I', mac: 'Command-I' },
+      exec: () => { this.aiInlineRequest() }
+    })
+
     this.editor.setShowPrintMargin(false)
     this.editor.resize(true)
 
@@ -165,12 +196,64 @@ class Editor extends Plugin {
 
     el.className += ' ' + css['ace-editor']
     el.editor = this.editor // required to access the editor during tests
+    // Ace (brace 0.8.0) renders its OWN selection, not a native DOM selection,
+    // so the browser's right-click "Copy" operates on an empty native
+    // selection and copies nothing. Provide a custom editor context menu wired
+    // to Ace's selection + the clipboard so right-click Copy/Cut/Paste works.
+    this._setupEditorContextMenu(el)
     this.render = () => el
 
-    // Completer for editor
+    // AI-backed completer. Only active for .sol files; pulls the current
+    // vendor/model/key from the AI panel, then asks the LLM for a FIM-style
+    // completion. Requests are debounced (~300ms) and any superseded request is
+    // aborted so only the latest keystroke's suggestion is delivered to Ace.
+    this._aiCompleteTimer = null
+    this._aiCompleteSeq = 0
     const flowCompleter = {
       getCompletions: (editor, session, pos, prefix, callback) => {
-        // @TODO add here other propositions
+        const path = this.currentSession
+        if (!path || !/\.sol$/.test(path)) {
+          callback(null, [])
+          return
+        }
+        if (this._aiCompleteTimer) clearTimeout(this._aiCompleteTimer)
+        // No AbortController across the plugin RPC boundary; instead tag each
+        // request and drop any result that a newer keystroke has superseded.
+        const seq = ++this._aiCompleteSeq
+        this._aiCompleteTimer = setTimeout(async () => {
+          try {
+            // Build prefix/suffix context around the cursor (bounded so we don't
+            // ship the whole file on every keystroke).
+            const doc = session.getValue()
+            const idx = session.doc.positionToIndex(pos, 0)
+            const MAX = 2000
+            const before = doc.slice(Math.max(0, idx - MAX), idx)
+            const after = doc.slice(idx, idx + MAX)
+            // The AI panel holds the key and runs the completion; only text
+            // comes back (returns '' when no key / panel never opened).
+            const suggestion = await this.call('aiPanel', 'aiComplete', { prefix: before, suffix: after, maxTokens: 64 })
+            if (seq !== this._aiCompleteSeq) return
+            const text = (suggestion || '').trim()
+            if (!text) { callback(null, []); return }
+            // Ace fuzzy-filters candidates against the typed identifier prefix
+            // and deletes that prefix before inserting `value` on accept. The
+            // FIM continuation deliberately does NOT repeat the prefix, so the
+            // raw text would (a) fail the filter and never show while typing,
+            // and (b) mangle the code when accepted. Prepend the prefix so the
+            // candidate both matches and inserts correctly.
+            const value = (prefix || '') + text
+            callback(null, [{
+              caption: (prefix || '') + text.split('\n')[0].slice(0, 60),
+              value,
+              meta: 'AI',
+              score: 1000
+            }])
+          } catch (e) {
+            // Never disrupt typing: log and return no AI suggestion.
+            console.debug('[aiComplete] skipped:', e && e.message)
+            callback(null, [])
+          }
+        }, 300)
       }
     }
     langTools.addCompleter(flowCompleter)
@@ -209,12 +292,46 @@ class Editor extends Plugin {
     this.editor.on('changeSession', () => {
       this._onChange()
       this.triggerEvent('sessionSwitched', [])
+      this.scheduleLint()
       this.editor.getSession().on('change', () => {
         this._onChange()
         this.sourceHighlighters.discardAllHighlights()
         this.triggerEvent('contentChanged', [])
+        this.scheduleLint()
       })
     })
+  }
+
+  // Debounced in-editor Solidity lint: parse the current .sol on idle and
+  // surface focused warnings as annotations (own 'solidityLint' tag, kept
+  // separate from compiler errors). Parser is lazy-loaded.
+  scheduleLint () {
+    if (this._lintTimer) clearTimeout(this._lintTimer)
+    this._lintTimer = setTimeout(() => this._runLint(), 600)
+  }
+
+  async _runLint () {
+    const path = this.currentSession
+    if (!path || !/\.sol$/.test(path)) return
+    const session = this.sessions[path]
+    if (!session) return
+    const content = session.getValue()
+    try {
+      // lazy chunk: parser + rules load only when a .sol is first linted
+      const { lintSolidity } = await import(/* webpackChunkName: "solidity-lint" */ '../tabs/solidity-lint')
+      const findings = lintSolidity(content)
+      // the file may have changed/closed while we awaited the parser
+      if (this.currentSession !== path || !this.sessions[path]) return
+      const kept = (this.sourceAnnotationsPerFile[path] || []).filter((a) => a.from !== 'solidityLint')
+      for (const f of findings) {
+        kept.push({ row: f.line - 1, column: Math.max(0, f.column - 1), text: `${f.message} [${f.rule}]`, type: f.severity === 'info' ? 'info' : 'warning', from: 'solidityLint' })
+      }
+      this.sourceAnnotationsPerFile[path] = kept
+      this._setAnnotations(this.sessions[path], path)
+    } catch (e) {
+      // lint must never disrupt editing
+      console.debug('[solidityLint] skipped:', e && e.message)
+    }
   }
 
   triggerEvent (name, params) {
@@ -234,6 +351,7 @@ class Editor extends Plugin {
   }
 
   onDeactivation () {
+    if (this._closeEditorContextMenu) this._closeEditorContextMenu()
     this.off('sidePanel', 'focusChanged')
     this.off('sidePanel', 'pluginDisabled')
   }
@@ -353,14 +471,205 @@ class Editor extends Plugin {
     }
   }
 
+  // Custom right-click menu for the Ace editor: Copy / Cut / Paste / Select all
+  // wired to the editor's own selection API + the async clipboard, because the
+  // native context menu can't see Ace's rendered selection.
+  _setupEditorContextMenu (el) {
+    const closeMenu = (refocusEditor) => {
+      if (!this._editorContextMenuEl) return
+      this._editorContextMenuEl.remove()
+      this._editorContextMenuEl = null
+      document.removeEventListener('mousedown', this._editorContextMenuClose, true)
+      document.removeEventListener('keydown', this._editorContextMenuKey, true)
+      window.removeEventListener('blur', closeMenu)
+      // keyboard dismissals (Escape/Tab) hand focus back to the editor; an
+      // outside mousedown must NOT — the click's own target takes focus
+      if (refocusEditor === true) { try { this.editor.focus() } catch (e) { /* editor gone */ } }
+    }
+    this._closeEditorContextMenu = closeMenu
+    this._editorContextMenuClose = (e) => {
+      if (this._editorContextMenuEl && !this._editorContextMenuEl.contains(e.target)) closeMenu()
+    }
+    this._editorContextMenuKey = (e) => {
+      const menu = this._editorContextMenuEl
+      if (!menu) return
+      // While the menu is open IT owns the keyboard (focus sits on the menu,
+      // not Ace's hidden textarea, so characters can't edit the document
+      // underneath). Escape/Tab must not fall through and also close/move
+      // whatever sits below the menu.
+      if (e.key === 'Escape' || e.key === 'Tab') {
+        e.preventDefault()
+        e.stopPropagation()
+        return closeMenu(true)
+      }
+      const rows = Array.from(menu.querySelectorAll('[role="menuitem"][data-enabled="true"]'))
+      if (!rows.length) return
+      const focusRow = (index) => {
+        e.preventDefault()
+        e.stopPropagation()
+        rows[(index + rows.length) % rows.length].focus()
+      }
+      if (e.key === 'ArrowDown') return focusRow(rows.indexOf(document.activeElement) + 1)
+      if (e.key === 'ArrowUp') return focusRow(rows.indexOf(document.activeElement) < 0 ? -1 : rows.indexOf(document.activeElement) - 1)
+      if (e.key === 'Home') return focusRow(0)
+      if (e.key === 'End') return focusRow(rows.length - 1)
+      if ((e.key === 'Enter' || e.key === ' ') && rows.includes(document.activeElement)) {
+        e.preventDefault()
+        e.stopPropagation()
+        document.activeElement.click()
+      }
+    }
+
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      closeMenu()
+      const selection = this.editor.getSelectedText() || ''
+      const hasSelection = !!selection
+      const readOnly = this.editor.getReadOnly && this.editor.getReadOnly()
+      const items = [
+        { label: 'Copy', enabled: hasSelection, run: () => this._editorCopy() },
+        { label: 'Cut', enabled: hasSelection && !readOnly, run: () => this._editorCut() },
+        { label: 'Paste', enabled: !readOnly, run: () => this._editorPaste() },
+        { sep: true },
+        { label: 'Select all', enabled: true, run: () => { this.editor.selectAll(); this.editor.focus() } }
+      ]
+      const menu = document.createElement('div')
+      menu.setAttribute('data-id', 'editorContextMenu')
+      menu.setAttribute('role', 'menu')
+      menu.tabIndex = -1
+      menu.style.cssText = 'position:fixed; z-index:10050; min-width:150px; padding:4px 0; background:var(--light,#fff); color:var(--text,#212529); border:1px solid var(--secondary,#ced4da); border-radius:4px; box-shadow:0 2px 10px rgba(0,0,0,.3); font-size:13px; user-select:none; outline:none;'
+      items.forEach((it) => {
+        if (it.sep) {
+          const s = document.createElement('div')
+          s.style.cssText = 'height:1px; margin:4px 0; background:var(--secondary,#ced4da); opacity:.6;'
+          menu.appendChild(s)
+          return
+        }
+        const row = document.createElement('div')
+        row.setAttribute('data-id', 'editorContextMenu' + it.label.replace(/\s/g, ''))
+        row.setAttribute('role', 'menuitem')
+        row.textContent = it.label
+        row.style.cssText = 'padding:5px 14px; white-space:nowrap; outline:none; cursor:' + (it.enabled ? 'pointer' : 'default') + '; opacity:' + (it.enabled ? '1' : '.45') + ';'
+        if (it.enabled) {
+          // focusable via the roving ArrowUp/Down handler (not the Tab order);
+          // focus shares the hover highlight as its visible indicator
+          row.tabIndex = -1
+          row.setAttribute('data-enabled', 'true')
+          const highlight = () => { row.style.background = 'var(--secondary,#e9ecef)' }
+          const unhighlight = () => { row.style.background = 'transparent' }
+          row.addEventListener('mouseenter', highlight)
+          row.addEventListener('mouseleave', unhighlight)
+          row.addEventListener('focus', highlight)
+          row.addEventListener('blur', unhighlight)
+          row.addEventListener('click', () => { closeMenu(); it.run() })
+        } else {
+          row.setAttribute('aria-disabled', 'true')
+        }
+        menu.appendChild(row)
+      })
+      document.body.appendChild(menu)
+      this._editorContextMenuEl = menu
+      // a keyboard-invoked contextmenu (Shift+F10 / menu key) carries no mouse
+      // point and would land at the top-left clamp — anchor it to the text
+      // cursor instead, one line below so the current line stays readable
+      let ax = e.clientX
+      let ay = e.clientY
+      if (ax <= 0 && ay <= 0) {
+        try {
+          const cur = this.editor.getCursorPosition()
+          const sc = this.editor.renderer.textToScreenCoordinates(cur.row, cur.column)
+          ax = sc.pageX - window.scrollX
+          ay = (sc.pageY - window.scrollY) + (this.editor.renderer.lineHeight || 14)
+        } catch (err) { ax = 8; ay = 8 }
+      }
+      // keep the menu inside the viewport
+      const mw = menu.offsetWidth
+      const mh = menu.offsetHeight
+      menu.style.left = Math.max(2, Math.min(ax, window.innerWidth - mw - 4)) + 'px'
+      menu.style.top = Math.max(2, Math.min(ay, window.innerHeight - mh - 4)) + 'px'
+      // The open menu owns the keyboard: take focus OFF Ace's hidden textarea
+      // (typing used to edit the document underneath the floating menu). A
+      // keyboard invocation lands on the first item so ArrowDown/Enter work
+      // immediately; a mouse invocation focuses the container, keeping hover
+      // behavior unchanged until the arrows are used.
+      const keyboardInvoked = e.clientX <= 0 && e.clientY <= 0
+      const firstRow = keyboardInvoked ? menu.querySelector('[role="menuitem"][data-enabled="true"]') : null
+      if (firstRow) firstRow.focus()
+      else menu.focus()
+      document.addEventListener('mousedown', this._editorContextMenuClose, true)
+      document.addEventListener('keydown', this._editorContextMenuKey, true)
+      window.addEventListener('blur', closeMenu)
+    })
+  }
+
+  _writeClipboard (text) {
+    if (!text) return
+    // Fallback: Ace fills the clipboard on its own 'copy' event.
+    const execCommandFallback = () => {
+      try { this.editor.focus(); document.execCommand('copy') } catch (e) { /* give up silently */ }
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        // writeText rejects ASYNCHRONOUSLY on permission/focus loss — a bare
+        // try/catch would miss it and skip the intended fallback
+        navigator.clipboard.writeText(text).catch(execCommandFallback)
+        return
+      }
+    } catch (e) { /* fall through to the Ace/execCommand path */ }
+    execCommandFallback()
+  }
+
+  _editorCopy () {
+    this._writeClipboard(this.editor.getSelectedText())
+    this.editor.focus()
+  }
+
+  _editorCut () {
+    if (this.editor.getReadOnly && this.editor.getReadOnly()) return
+    const text = this.editor.getSelectedText()
+    if (!text) return
+    this._writeClipboard(text)
+    this.editor.insert('') // remove the selection
+    this.editor.focus()
+  }
+
+  async _editorPaste () {
+    if (this.editor.getReadOnly && this.editor.getReadOnly()) return
+    this.editor.focus()
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text) this.editor.insert(text)
+    } catch (e) {
+      // Clipboard read blocked (permission/insecure context): leave the editor
+      // focused so the user can still paste with Ctrl/Cmd+V.
+    }
+  }
+
   /**
    * Set the text in the current session, if any.
    * @param {string} text New text to be place.
    */
   setText (text) {
-    if (this.currentSession && this.sessions[this.currentSession]) {
-      this.sessions[this.currentSession].setValue(text)
-    }
+    if (!this.currentSession || !this.sessions[this.currentSession]) return
+    const session = this.sessions[this.currentSession]
+    const current = session.getValue()
+    // No-op save (editor already holds this content): leave the document and
+    // its undo stack untouched, so a plain Ctrl+S doesn't churn history.
+    if (current === text) return
+    // Replace over the whole document instead of setValue: setValue resets the
+    // session and wipes the undo stack, so a "Format code" became un-undoable.
+    // A full-range replace is recorded as a single undoable edit (Ctrl+Z then
+    // reverts the format). Cursor/scroll are restored around the edit.
+    const selectionRange = session.selection ? session.selection.getRange() : null
+    const scrollTop = this.editor && this.editor.getSession() === session ? this.editor.getSession().getScrollTop() : null
+    const lastRow = session.getLength() - 1
+    const fullRange = new Range(0, 0, lastRow, session.getLine(lastRow).length)
+    session.replace(fullRange, text)
+    try {
+      if (selectionRange) session.selection.setRange(selectionRange)
+      if (scrollTop !== null) session.setScrollTop(scrollTop)
+    } catch (e) { /* selection/scroll restore is best-effort */ }
   }
 
   /**
@@ -556,7 +865,9 @@ class Editor extends Plugin {
 
     const annotations = this.sourceAnnotationsPerFile[this.currentSession]
     for (const annotation of annotations) {
-      annotation.hide = annotation.from !== name
+      // 'solidityLint' is the editor's own live linter, not a side panel
+      // plugin, so a panel focus change must never hide its annotations
+      annotation.hide = annotation.from !== name && annotation.from !== 'solidityLint'
     }
 
     this._setAnnotations(this.editor.getSession(), this.currentSession)
@@ -618,6 +929,82 @@ class Editor extends Plugin {
   _setAnnotations (session, path) {
     const annotations = this.sourceAnnotationsPerFile[path]
     session.setAnnotations(annotations.filter((element) => !element.hide))
+  }
+
+  // Best-effort user notification; never throws. Uses the app's tooltip toast
+  // directly — there is no 'notification' plugin on the bus, so a this.call
+  // there would reject and the message would silently die in the console,
+  // making the AI keybindings look broken on every guard path.
+  _notify (message) {
+    try {
+      addTooltip(message)
+    } catch (e) {
+      console.warn('[editor] ' + message)
+    }
+  }
+
+  // Send the current file to the AI panel for a plain-language explanation.
+  async aiExplainContract () {
+    const file = this.current()
+    const code = this.currentContent()
+    if (!code) { this._notify('Nothing to explain: the editor is empty.'); return }
+    try {
+      await this.call('aiPanel', 'explainContract', { code, file })
+    } catch (e) {
+      this._notify('Could not reach the AI panel: ' + (e && e.message))
+    }
+  }
+
+  // Inline `//` AI request. Reads the current line; if it is a `// instruction`
+  // comment, asks the LLM to fulfil it using the surrounding file as context and
+  // inserts the returned code on the line below the comment.
+  async aiInlineRequest () {
+    const path = this.currentSession
+    if (!path) return
+    const session = this.editor.getSession()
+    const cursor = this.editor.getCursorPosition()
+    const lineText = session.getLine(cursor.row) || ''
+    const m = lineText.match(/^\s*\/\/\s?(.*)$/)
+    if (!m || !m[1].trim()) {
+      this._notify('Place the cursor on a `// your request` comment line first.')
+      return
+    }
+    const instruction = m[1].trim()
+
+    let hasKey
+    try {
+      hasKey = await this.call('aiPanel', 'hasAiKey')
+    } catch (e) {
+      this._notify('Could not reach the AI panel: ' + (e && e.message))
+      return
+    }
+    if (!hasKey) {
+      this._notify('Set an AI key in the AI panel to use inline `//` requests.')
+      return
+    }
+
+    const doc = session.getValue()
+    const idx = session.doc.positionToIndex({ row: cursor.row + 1, column: 0 }, 0)
+    const MAX = 4000
+    const before = doc.slice(Math.max(0, idx - MAX), idx)
+    const after = doc.slice(idx, idx + MAX)
+    const prefix = `${before}\n// Task: ${instruction}\n`
+
+    try {
+      // Key stays in the AI panel; only the generated text returns.
+      const result = await this.call('aiPanel', 'aiComplete', { prefix, suffix: after, maxTokens: 512 })
+      let text = (result || '').trim()
+      // Strip accidental markdown fences if the model added them.
+      text = text.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim()
+      if (!text) { this._notify('AI returned no code for that request.'); return }
+      // Insert at the end of the comment line so it works even when the comment
+      // is the last line of the file (no trailing newline to land on).
+      const commentEnd = { row: cursor.row, column: lineText.length }
+      session.insert(commentEnd, '\n' + text)
+    } catch (e) {
+      if (e && e.name === 'AbortError') return
+      this._notify('AI request failed: ' + (e && e.message))
+    }
   }
 
   /**

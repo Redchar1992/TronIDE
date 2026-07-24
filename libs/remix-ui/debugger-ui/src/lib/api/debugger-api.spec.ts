@@ -57,6 +57,7 @@ describe('DebuggerApiMixin getTrace runtime path', () => {
 
     api.call = jest.fn(async (profile, method, ...args) => {
       if (profile === 'network' && method === 'detectNetwork') return { name: 'custom' }
+      if (profile === 'network' && method === 'getNetworkProvider') return 'custom'
       if (profile === 'fetchAndCompile' && method === 'resolve') return null
       throw new Error(`unexpected call ${profile}.${method} ${args.join(',')}`)
     })
@@ -104,5 +105,29 @@ describe('DebuggerApiMixin getTrace runtime path', () => {
     )
     expect(warn).toHaveBeenCalledTimes(1)
     warn.mockRestore()
+  })
+
+  it('reports Injected TronWeb as unsupported before starting the debugger', async () => {
+    const { api } = createApi()
+    api.call = jest.fn(async (profile, method) => {
+      if (profile === 'network' && method === 'getNetworkProvider') return 'injected'
+      throw new Error(`unexpected call ${profile}.${method}`)
+    })
+
+    await expect(api.getDebugTraceCapability()).resolves.toEqual({
+      supported: false,
+      provider: 'injected',
+      message: expect.stringContaining('TronLink does not expose transaction VM traces')
+    })
+  })
+
+  it('keeps standalone debugger hosts usable when the network API is absent', async () => {
+    const { api } = createApi()
+    api.call = jest.fn(async () => { throw new Error('network plugin unavailable') })
+
+    await expect(api.getDebugTraceCapability()).resolves.toEqual({
+      supported: true,
+      provider: undefined
+    })
   })
 })

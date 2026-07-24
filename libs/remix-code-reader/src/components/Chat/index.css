@@ -330,6 +330,20 @@
   background-color: rgba(145, 151, 157, 0.3);
   cursor: not-allowed;
 }
+.chat-wapper .chat-input-wrapper .textarea-wrapper .submit-btn.ai-busy-stop {
+  background-color: #c0392b;
+  cursor: pointer;
+}
+.chat-wapper .chat-input-wrapper .textarea-wrapper .submit-btn.ai-busy-stop:hover {
+  background-color: #d84a3b;
+}
+.chat-wapper .chat-input-wrapper .textarea-wrapper .submit-btn .ai-stop-glyph {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: #fff;
+}
 .chat-wapper .chat-input-wrapper .textarea-wrapper.textarea-disabled {
   cursor: not-allowed;
 }

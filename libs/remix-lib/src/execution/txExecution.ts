@@ -97,7 +97,10 @@ export function checkVMError (execResult, abi, contract) {
   }
   const ret = {
     error: false,
-    message: ''
+    message: '',
+    // A concise, single-line summary of the revert cause for programmatic
+    // callers (the AI write path). `.message` stays the verbose UI text.
+    reason: ''
   }
   if (!execResult.exceptionError) {
     return ret
@@ -108,81 +111,111 @@ export function checkVMError (execResult, abi, contract) {
   if (exceptionError === errorCode.INVALID_OPCODE) {
     msg = '\t\n\tThe execution might have thrown.\n'
     ret.error = true
+    ret.reason = 'invalid opcode (the execution may have thrown)'
   } else if (exceptionError === errorCode.OUT_OF_GAS) {
     msg = '\tThe transaction ran out of gas. Please increase the Gas Limit.\n'
     ret.error = true
+    ret.reason = 'out of gas — increase the gas/fee limit'
   } else if (exceptionError === errorCode.REVERT) {
-    const returnData = execResult.returnValue
+    // The tvmjs VM hands back returnValue as a Uint8Array, not a Buffer, so
+    // `.slice(0,4).toString('hex')` produced a comma-joined decimal string —
+    // the 4-byte selector never matched and EVERY revert fell through to the
+    // generic message (custom errors and require() strings alike were never
+    // decoded, in the terminal or the AI path). Normalize to a Buffer first.
+    const returnData = execResult.returnValue ? Buffer.from(execResult.returnValue) : Buffer.alloc(0)
     const returnDataHex = returnData.slice(0, 4).toString('hex')
     let customError
-    if (abi) {
-      let decodedCustomErrorInputsClean
-      for (const item of abi) {
-        if (item.type === 'error') {
+    // Now that the Buffer fix makes the 4-byte selector match, the ethers
+    // decodes below actually run — and they THROW on a truncated/malformed
+    // payload (a hand-rolled `revert` with a real selector but a short tail).
+    // This function is called from an unwrapped async waterfall callback
+    // (blockchain.js runTx), so an escaping throw would strand the tx as
+    // "pending" forever. Contain it and fall back to the generic message.
+    try {
+      if (abi) {
+        let decodedCustomErrorInputsClean
+        for (const item of abi) {
+          if (item.type === 'error') {
           // ethers doesn't crash anymore if "error" type is specified, but it doesn't extract the errors. see:
           // https://github.com/ethers-io/ethers.js/commit/bd05aed070ac9e1421a3e2bff2ceea150bedf9b7
           // we need here to fake the type, so the "getSighash" function works properly
-          const fn = getFunctionFragment({ ...item, type: 'function', stateMutability: 'nonpayable' })
-          if (!fn) continue
-          const sign = fn.getSighash(item.name)
-          if (!sign) continue
-          if (returnDataHex === sign.replace('0x', '')) {
-            customError = item.name
-            const functionDesc = fn.getFunction(item.name)
-            // decoding error parameters
-            const decodedCustomErrorInputs = fn.decodeFunctionData(functionDesc, returnData)
-            decodedCustomErrorInputsClean = {}
-            let devdoc: NatSpecErrorDoc = {}
-            // "contract" reprensents the compilation result containing the NATSPEC documentation
-            if (contract && fn.functions && Object.keys(fn.functions).length) {
-              const functionSignature = Object.keys(fn.functions)[0]
-              // we check in the 'devdoc' if there's a developer documentation for this error
-              try {
-                devdoc = (contract.object.devdoc.errors && contract.object.devdoc.errors[functionSignature][0]) || {}
-              } catch (e) {
-                console.error(e.message)
+            const fn = getFunctionFragment({ ...item, type: 'function', stateMutability: 'nonpayable' })
+            if (!fn) continue
+            const sign = fn.getSighash(item.name)
+            if (!sign) continue
+            if (returnDataHex === sign.replace('0x', '')) {
+              customError = item.name
+              const functionDesc = fn.getFunction(item.name)
+              // decoding error parameters
+              const decodedCustomErrorInputs = fn.decodeFunctionData(functionDesc, returnData)
+              decodedCustomErrorInputsClean = {}
+              let devdoc: NatSpecErrorDoc = {}
+              // "contract" reprensents the compilation result containing the NATSPEC documentation
+              if (contract && fn.functions && Object.keys(fn.functions).length) {
+                const functionSignature = Object.keys(fn.functions)[0]
+                // we check in the 'devdoc' if there's a developer documentation for this error
+                try {
+                  devdoc = (contract.object.devdoc.errors && contract.object.devdoc.errors[functionSignature][0]) || {}
+                } catch (e) {
+                  console.error(e.message)
+                }
+                // we check in the 'userdoc' if there's an user documentation for this error
+                try {
+                  const userdoc: NatSpecErrorDoc = (contract.object.userdoc.errors && contract.object.userdoc.errors[functionSignature][0]) || {}
+                  if (userdoc && userdoc.notice) customError += ' : ' + userdoc.notice // we append the user doc if any
+                } catch (e) {
+                  console.error(e.message)
+                }
               }
-              // we check in the 'userdoc' if there's an user documentation for this error
-              try {
-                const userdoc: NatSpecErrorDoc = (contract.object.userdoc.errors && contract.object.userdoc.errors[functionSignature][0]) || {}
-                if (userdoc && userdoc.notice) customError += ' : ' + userdoc.notice // we append the user doc if any
-              } catch (e) {
-                console.error(e.message)
-              }
-            }
-            let inputIndex = 0
-            for (const input of functionDesc.inputs) {
-              const inputKey = input.name || inputIndex
-              const v = decodedCustomErrorInputs[inputKey]
+              let inputIndex = 0
+              for (const input of functionDesc.inputs) {
+                const inputKey = input.name || inputIndex
+                const v = decodedCustomErrorInputs[inputKey]
 
-              decodedCustomErrorInputsClean[inputKey] = {
-                value: v.toString ? v.toString() : v
+                decodedCustomErrorInputsClean[inputKey] = {
+                  value: v.toString ? v.toString() : v
+                }
+                if (devdoc && devdoc.params) {
+                  decodedCustomErrorInputsClean[input.name].documentation = devdoc.params[inputKey] // we add the developer documentation for this input parameter if any
+                }
+                inputIndex++
               }
-              if (devdoc && devdoc.params) {
-                decodedCustomErrorInputsClean[input.name].documentation = devdoc.params[inputKey] // we add the developer documentation for this input parameter if any
-              }
-              inputIndex++
+              break
             }
-            break
           }
         }
+        if (decodedCustomErrorInputsClean) {
+          msg = '\tThe transaction has been reverted to the initial state.\nError provided by the contract:'
+          msg += `\n${customError}`
+          msg += '\nParameters:'
+          msg += `\n${JSON.stringify(decodedCustomErrorInputsClean, null, ' ')}`
+          // concise form: Name(k=v, …)
+          const argPairs = Object.keys(decodedCustomErrorInputsClean).map((k) => `${k}=${decodedCustomErrorInputsClean[k] && decodedCustomErrorInputsClean[k].value}`)
+          ret.reason = `reverted with custom error ${String(customError).split(' : ')[0]}(${argPairs.join(', ')})`
+        }
       }
-      if (decodedCustomErrorInputsClean) {
-        msg = '\tThe transaction has been reverted to the initial state.\nError provided by the contract:'
-        msg += `\n${customError}`
-        msg += '\nParameters:'
-        msg += `\n${JSON.stringify(decodedCustomErrorInputsClean, null, ' ')}`
-      }
-    }
-    if (!customError) {
+      if (!customError) {
       // It is the hash of Error(string)
-      if (returnData && (returnDataHex === '08c379a0')) {
-        const abiCoder = new ethers.utils.AbiCoder()
-        const reason = abiCoder.decode(['string'], returnData.slice(4))[0]
-        msg = `\tThe transaction has been reverted to the initial state.\nReason provided by the contract: "${reason}".`
-      } else {
-        msg = '\tThe transaction has been reverted to the initial state.\nNote: The called function should be payable if you send value and the value you send should be less than your current balance.'
+        if (returnData && (returnDataHex === '08c379a0')) {
+          const abiCoder = new ethers.utils.AbiCoder()
+          const reason = abiCoder.decode(['string'], returnData.slice(4))[0]
+          msg = `\tThe transaction has been reverted to the initial state.\nReason provided by the contract: "${reason}".`
+          ret.reason = `reverted: ${reason}`
+        } else if (returnData && (returnDataHex === '4e487b71')) {
+        // Panic(uint256) — Solidity 0.8 assert/overflow/array-oob etc.
+          const abiCoder = new ethers.utils.AbiCoder()
+          const code = abiCoder.decode(['uint256'], returnData.slice(4))[0]
+          const hex = '0x' + BigInt(code.toString()).toString(16).padStart(2, '0')
+          msg = `\tThe transaction has been reverted to the initial state.\nPanic error ${hex}.`
+          ret.reason = `reverted with Panic(${hex})`
+        } else {
+          msg = '\tThe transaction has been reverted to the initial state.\nNote: The called function should be payable if you send value and the value you send should be less than your current balance.'
+          ret.reason = 'reverted (no reason string)'
+        }
       }
+    } catch (decodeErr) {
+      msg = '\tThe transaction has been reverted to the initial state.'
+      ret.reason = 'reverted (reason could not be decoded)'
     }
     ret.error = true
   } else if (exceptionError === errorCode.STATIC_STATE_CHANGE) {

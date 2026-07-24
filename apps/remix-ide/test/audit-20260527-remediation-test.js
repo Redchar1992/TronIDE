@@ -20,16 +20,24 @@ function pathExists (relativePath) {
   return fs.existsSync(path.join(__dirname, '..', '..', '..', relativePath))
 }
 
-test('GitHub PAT is kept in sessionStorage only and legacy localStorage copies are scrubbed', function (t) {
+// The token is tab-scoped: sessionStorage supplies refresh continuity, while
+// localStorage/config remain forbidden so the credential does not outlive the
+// tab. These assertions pin both sides of that contract.
+test('GitHub token survives refresh only in the current tab', function (t) {
   const source = readIdeSource('app/ui/landing-page/landing-page.js')
+  const authSource = readIdeSource('lib/github-auth.js')
 
-  t.notOk(/localStorage\.setItem\('tronide\.github\.token'/.test(source), 'GitHub token is never written to localStorage')
-  t.notOk(/localStorage\.setItem\('tronide\.github\.user'/.test(source), 'GitHub user metadata is never written to localStorage')
-  t.ok(/sessionStorage\.setItem\('tronide\.github\.token'/.test(source), 'GitHub token is still saved in sessionStorage for the current tab')
+  t.notOk(/localStorage\.setItem\('tronide\.github\.token'/.test(source + authSource), 'GitHub token is never written to localStorage')
+  t.notOk(/localStorage\.setItem\('tronide\.github\.user'/.test(source + authSource), 'GitHub user metadata is never written to localStorage')
+  t.ok(/sessionStorage\.setItem\(key, value\)/.test(authSource), 'GitHub credentials are mirrored to the current tab session')
+  t.ok(/sessionStorage\.getItem\(key\)/.test(authSource), 'GitHub credentials are rehydrated after a refresh')
+  t.ok(/githubAuth\.getToken\(\)/.test(source), 'render mirrors the authoritative tab-session token store (lib/github-auth)')
+  t.notOk(/sessionStorage\.removeItem\('tronide\.github\.token'\)/.test(source), 'Home startup does not erase the refreshed session token')
+  t.notOk(/sessionStorage\.removeItem\('tronide\.github\.user'\)/.test(source), 'Home startup does not erase the refreshed session login')
   t.ok(/localStorage\.removeItem\('tronide\.github\.token'\)/.test(source), 'startup and disconnect scrub the legacy localStorage token entry')
   t.ok(/localStorage\.removeItem\('tronide\.github\.user'\)/.test(source), 'startup and disconnect scrub the legacy localStorage user entry')
   t.notOk(/id="githubTokenRemember"/.test(source), 'the "Remember in this browser" checkbox has been removed from the Connect Token modal')
-  t.ok(/Tokens stay in this browser tab only/.test(source), 'Connect Token modal advertises tab-only storage')
+  t.ok(/Tokens stay in this browser tab, survive a refresh/.test(source), 'Connect Token modal advertises refresh-safe tab-only storage')
   t.ok(/sanitizeGithubError/.test(source), 'GitHub error messages flow through a sanitizer before reaching the UI')
   t.ok(/\[redacted\]/.test(source), 'sanitizer redacts token-shaped substrings')
   t.end()
@@ -84,13 +92,13 @@ test('patched vulnerable dependencies are pinned in package.json and gist handle
   t.equal(packageJson.dependencies['js-cookie'], '3.0.7', 'js-cookie is bumped past CVE-2026-46625 (HIGH)')
   t.equal(packageJson.dependencies.qs, '6.15.2', 'qs is bumped past CVE-2026-8723 (MODERATE)')
   t.equal(packageJson.pnpm.overrides.qs, '6.15.2', 'qs override is bumped past CVE-2026-8723')
-  t.equal(packageJson.pnpm.overrides.tmp, '0.2.6', 'tmp override is added to clear CVE-2026-44705 (HIGH) and CVE-2025-54798 (LOW)')
+  t.equal(packageJson.pnpm.overrides.tmp, '0.2.7', 'tmp override is pinned to 0.2.7, clearing CVE-2026-44705 (HIGH) and CVE-2025-54798 (LOW)')
   t.equal(packageJson.pnpm.overrides['js-cookie'], '3.0.7', 'js-cookie override is added to enforce the patched version across transitives')
   t.notOk(packageJson.dependencies.request, 'deprecated request is not a runtime dependency')
   t.notOk(packageJson.devDependencies.request, 'deprecated request is not a dev dependency either')
   t.ok(/js-cookie@3\.0\.7:/.test(lockfile), 'lockfile resolves js-cookie@3.0.7')
   t.ok(/qs@6\.15\.2:/.test(lockfile), 'lockfile resolves qs@6.15.2')
-  t.ok(/tmp@0\.2\.6:/.test(lockfile), 'lockfile resolves tmp@0.2.6')
+  t.ok(/tmp@0\.2\.7:/.test(lockfile), 'lockfile resolves tmp@0.2.7')
   t.notOk(/require\(['"]request['"]\)/.test(handlerSource), 'gist-handler.js no longer imports the deprecated request module')
   t.ok(/window\.fetch/.test(handlerSource), 'gist-handler.js fetches gists via window.fetch')
   t.ok(/redirect:\s*'error'/.test(handlerSource), 'gist-handler.js disables cross-host redirects so CVE-2023-28155-style SSRF is not reachable through this path')

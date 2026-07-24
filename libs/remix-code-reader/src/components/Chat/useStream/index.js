@@ -68,6 +68,7 @@ const useStream = ({
 
       if(_stream){
         for await (const chunk of res) {
+          if (params?.signal?.aborted) break;
           let content;
           if(openSDKList.includes(vendor)){
             content = chunk.choices?.[0]?.delta?.content;
@@ -80,6 +81,11 @@ const useStream = ({
             assistantMessage += content;
             setStreamData(content,params?.model);
           }
+        }
+        // An Esc mid-stream keeps the partial text — mark it as interrupted so
+        // the cut-off doesn't read like a finished (truncated-looking) answer.
+        if (params?.signal?.aborted) {
+          setStreamData((assistantMessage ? '\n\n' : '') + '⏹ Stopped.', params?.model);
         }
       }else{
         if(openSDKList.includes(vendor)){
@@ -95,9 +101,15 @@ const useStream = ({
     } catch (e) {
       setLoading(false);
       setLoadingCompleted(false);
+      // Abort is a user action, not an error. SDKs vary on the name
+      // (AbortError / APIUserAbortError), so also trust the signal. Still tell
+      // the user it stopped — silence here looked like a hang that "fixed
+      // itself" (the request may have died before the first chunk arrived).
+      if (params?.signal?.aborted || /abort/i.test(e?.name || "") || e?.name === "AbortError") {
+        setStreamData("⏹ Stopped.", params?.model);
+        return;
+      }
       console.error("fetchStreamData error:", e);
-
-      if (e.name === "AbortError") return;
       setError(e.message || "Unknown error");
     }
   };

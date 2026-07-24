@@ -37,6 +37,21 @@ export interface RemixUiStaticAnalyserProps {
   analysisModule: any
 }
 
+// The MISC ("Miscellaneous") category is advisory: Guard conditions (a generic
+// assert/require reminder that fires on correct code too), similar-variable-name
+// hints and view/pure suggestions. These are style/education, not defects — they
+// are shown but EXCLUDED from the left-icon badge count so the badge reflects
+// issues worth acting on (Security/Gas/ERC/TRON/Slither).
+const ADVISORY_CATEGORY_IDS = ['MISC']
+const SUMMARY_ORDER = [
+  { id: 'SEC', label: 'Security', cls: 'badge-danger' },
+  { id: 'GAS', label: 'Gas', cls: 'badge-warning' },
+  { id: 'ERC', label: 'ERC', cls: 'badge-info' },
+  { id: 'TRON', label: 'TRON', cls: 'badge-info' },
+  { id: 'SLITHER', label: 'Slither', cls: 'badge-secondary' },
+  { id: 'MISC', label: 'Advisory', cls: 'badge-light' }
+]
+
 export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
   const [runner] = useState(new StaticAnalysisRunner())
 
@@ -81,12 +96,41 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
 
   const warningContainer = React.useRef(null)
   const [warningState, setWarningState] = useState({})
+  const [collapsedGroups, setCollapsedGroups] = useState({})
   const [state, dispatch] = useReducer(analysisReducer, initialState)
   const [currentFile, setCurrentFile] = useState('')
+  // Analysis runs over the FULL compiled source, so imported libraries
+  // (OpenZeppelin etc.) flood the panel with findings the user didn't write.
+  // Default to hiding those and show only the user's own files; a toggle brings
+  // them back.
+  const [hideLibraryWarnings, setHideLibraryWarnings] = useState(true)
+  const [hiddenLibraryCount, setHiddenLibraryCount] = useState(0)
+  // Findings counted by category (categoryId -> count) for the summary bar, so
+  // the user can see at a glance that most of a big number is low-value
+  // advisory noise (Guard conditions, similar names) rather than real issues.
+  const [categorySummary, setCategorySummary] = useState({})
 
   useEffect(() => {
     compilation(props.analysisModule, dispatch)
   }, [props])
+
+  // A finding's source file is an external dependency (not the user's code).
+  // Matches only unambiguous dependency markers so it never hides a user's own
+  // file: a bare-package specifier ('@openzeppelin/…'), a vendored path
+  // ('.deps/', 'node_modules/', 'installed_contracts/'), or a remote-import URL
+  // scheme (github/https/ipfs/swarm — how github/npm imports get keyed).
+  const isLibraryFile = (fileName) => {
+    if (!fileName) return false
+    const f = String(fileName)
+    return f.startsWith('@') ||
+      /(^|\/)(\.deps|node_modules|installed_contracts)\//.test(f) ||
+      /^(https?|github|ipfs|swarm|bzz-raw):/i.test(f)
+  }
+
+  // Re-filter (cheap re-run over the cached compilation) when the toggle flips.
+  useEffect(() => {
+    if (state.data) run(state.data, state.source, state.file)
+  }, [hideLibraryWarnings]) // eslint-disable-line
 
   useEffect(() => {
     const reset = () => { setCurrentFile('') }
@@ -105,6 +149,7 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
 
   useEffect(() => {
     setWarningState({})
+    setCategorySummary({})
     if (autoRun) {
       if (state.data !== null) {
         run(state.data, state.source, state.file)
@@ -119,6 +164,7 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
     props.analysisModule.on('filePanel', 'setWorkspace', (currentWorkspace) => {
       // Reset warning state
       setWarningState([])
+      setCategorySummary({})
       // Reset badge
       props.event.trigger('staticAnaysisWarning', [])
       // Reset state
@@ -135,6 +181,7 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
       if (plugin.name === 'remixd') {
         // Reset warning state
         setWarningState([])
+        setCategorySummary({})
         // Reset badge
         props.event.trigger('staticAnaysisWarning', [])
         // Reset state
@@ -179,12 +226,24 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
 
     const groupedCategory = groupBy(resultArray, groupByKey)
     setWarningState(groupedCategory)
+    // advisory groups (style/naming reminders) can easily outnumber the
+    // meaningful findings 10:1 — start them collapsed so Security/Gas stay
+    // above the fold; a click on the group header expands them
+    const initialCollapsed = {}
+    Object.entries(groupedCategory).forEach(([groupName, items]) => {
+      const categoryId = (items[0] && (items[0] as any).warningCategoryId) || 'MISC'
+      if (ADVISORY_CATEGORY_IDS.includes(categoryId)) initialCollapsed[groupName] = true
+    })
+    // defaults only seed groups the user has NOT toggled: autorun re-analyzes
+    // on every compile, and rebuilding the state from scratch snapped a
+    // manually expanded advisory group shut on each recompile
+    setCollapsedGroups(prev => ({ ...initialCollapsed, ...prev }))
   }
 
   const run = (lastCompilationResult, lastCompilationSource, compiledFile) => {
     if (state.data !== null) {
       if (lastCompilationResult && (categoryIndex.length > 0 || slitherEnabled)) {
-        let warningCount = 0
+        let hiddenCount = 0
         const warningMessage = []
         const warningErrors = []
 
@@ -197,14 +256,26 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
         const remixCategories = astValidForCurrentFile ? categoryIndex : []
         const slitherTargetFile = astValidForCurrentFile ? compiledFile : currentFile
 
+        // Emit the badge count (meaningful only — advisory excluded) plus the
+        // per-category summary for the bar, from the collected findings.
+        const finalizeSummary = (msgs) => {
+          const byCat = {}
+          msgs.forEach((m) => { const c = m.warningCategoryId || 'MISC'; byCat[c] = (byCat[c] || 0) + 1 })
+          setCategorySummary(byCat)
+          const meaningful = msgs.filter((m) => !ADVISORY_CATEGORY_IDS.includes(m.warningCategoryId || 'MISC')).length
+          props.event.trigger('staticAnaysisWarning', [meaningful])
+        }
+
         // Remix Analysis
         runner.run(lastCompilationResult, remixCategories, results => {
           results.map((result) => {
             let moduleName
+            let moduleCategoryId
             Object.keys(groupedModules).map(key => {
               groupedModules[key].forEach(el => {
                 if (el.name === result.name) {
                   moduleName = groupedModules[key][0].categoryDisplayName
+                  moduleCategoryId = key
                 }
               })
             })
@@ -232,7 +303,9 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
                 locationString = row + 1 + ':' + column + ':'
                 fileName = Object.keys(lastCompilationResult.sources)[file]
               }
-              warningCount++
+              // Skip findings from imported libraries (OpenZeppelin etc.) unless
+              // the user opted to see them — that is what makes the count explode.
+              if (hideLibraryWarnings && isLibraryFile(fileName)) { hiddenCount++; return }
               const msg = message(item.name, item.warning, item.more, fileName, locationString)
               const options = {
                 type: 'warning',
@@ -248,7 +321,7 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
                 location: location
               }
               warningErrors.push(options)
-              warningMessage.push({ msg, options, hasWarning: true, warningModuleName: moduleName })
+              warningMessage.push({ msg, options, hasWarning: true, warningModuleName: moduleName, warningCategoryId: moduleCategoryId })
             })
           })
           // Slither Analysis
@@ -286,7 +359,7 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
                         fileName = Object.keys(lastCompilationResult.sources)[fileIndex]
                       }
                     }
-                    warningCount++
+                    if (hideLibraryWarnings && isLibraryFile(fileName)) { hiddenCount++; return }
                     const msg = message(item.title, item.description, item.more, fileName, locationString)
                     const options = {
                       type: 'warning',
@@ -302,25 +375,30 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
                       location: location
                     }
                     warningErrors.push(options)
-                    warningMessage.push({ msg, options, hasWarning: true, warningModuleName: 'Slither Analysis' })
+                    warningMessage.push({ msg, options, hasWarning: true, warningModuleName: 'Slither Analysis', warningCategoryId: 'SLITHER' })
                   })
+                  setHiddenLibraryCount(hiddenCount)
                   showWarnings(warningMessage, 'warningModuleName')
-                  props.event.trigger('staticAnaysisWarning', [warningCount])
+                  finalizeSummary(warningMessage)
                 }
               }).catch(() => {
                 props.analysisModule.call('terminal', 'log', { type: 'error', value: '[Slither Analysis]: Error occured! See remixd console for details.' })
+                setHiddenLibraryCount(hiddenCount)
                 showWarnings(warningMessage, 'warningModuleName')
+                finalizeSummary(warningMessage)
               })
             })
           } else {
+            setHiddenLibraryCount(hiddenCount)
             showWarnings(warningMessage, 'warningModuleName')
-            props.event.trigger('staticAnaysisWarning', [warningCount])
+            finalizeSummary(warningMessage)
           }
         })
       } else {
         if (categoryIndex.length) {
           warningContainer.current.innerText = 'No compiled AST available'
         }
+        setCategorySummary({})
         props.event.trigger('staticAnaysisWarning', [-1])
       }
     }
@@ -464,6 +542,21 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
           />
           <Button buttonText="Run" onClick={() => run(state.data, state.source, state.file)} disabled={(!hasCompilationForCurrentFile || categoryIndex.length === 0) && !slitherEnabled }/>
         </div>
+        <div className="d-flex mt-1" id="hideLibraryWarnings">
+          <RemixUiCheckbox
+            id="hideLibraryWarningsCheckbox"
+            inputType="checkbox"
+            onClick={() => setHideLibraryWarnings(!hideLibraryWarnings)}
+            checked={hideLibraryWarnings}
+            label="Hide results from imported libraries"
+            onChange={() => {}}
+          />
+        </div>
+        { hideLibraryWarnings && hiddenLibraryCount > 0 &&
+          <div className="text-muted small mt-1" data-id="staticAnalysisHiddenLibraryNote">
+            { hiddenLibraryCount } finding{ hiddenLibraryCount > 1 ? 's' : '' } in imported libraries (OpenZeppelin etc.) hidden — untick above to show them.
+          </div>
+        }
         { showSlither &&
           <div className="d-flex mt-2" id="enableSlitherAnalysis">
             <RemixUiCheckbox
@@ -506,14 +599,55 @@ export const RemixUiStaticAnalyser = (props: RemixUiStaticAnalyserProps) => {
         </span>
       </div>
       <br/>
+      { Object.keys(categorySummary).length > 0 &&
+        <div className="mb-2" data-id="staticAnalysisCategorySummary">
+          <div className="d-flex flex-wrap align-items-center">
+            { SUMMARY_ORDER.filter((c) => categorySummary[c.id]).map((c) => (
+              <span
+                key={c.id}
+                className={`badge ${c.cls} mr-1 mb-1`}
+                data-id={`staticAnalysisSummary-${c.id}`}
+                title={ ADVISORY_CATEGORY_IDS.includes(c.id) ? 'Advisory / style reminders — not counted in the sidebar badge' : `${c.label} findings` }
+              >
+                { c.label } { categorySummary[c.id] }
+              </span>
+            )) }
+          </div>
+          { ADVISORY_CATEGORY_IDS.some((id) => categorySummary[id]) &&
+            <div className="text-muted small mt-1">
+              Advisory findings (assert/require reminders, naming) are shown below but excluded from the sidebar icon count.
+            </div>
+          }
+        </div>
+      }
       {Object.entries(warningState).length > 0 &&
         <div id='staticanalysisresult' >
           <div className="mb-4">
             {
               (Object.entries(warningState).map((element, index) => (
                 <div key={index}>
-                  <span className="text-dark h6">{element[0]}</span>
-                  {element[1]['map']((x, i) => ( // eslint-disable-line dot-notation
+                  <div
+                    className="d-flex align-items-center"
+                    style={{ cursor: 'pointer' }}
+                    data-id={`staticAnalysisGroupHeader${element[0]}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-expanded={!collapsedGroups[element[0]]}
+                    onClick={() => setCollapsedGroups(prev => ({ ...prev, [element[0]]: !prev[element[0]] }))}
+                    onKeyDown={(e) => {
+                      // advisory groups start collapsed — without a key handler
+                      // they were unreachable for keyboard/screen-reader users
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault() // Space must not scroll the panel
+                        setCollapsedGroups(prev => ({ ...prev, [element[0]]: !prev[element[0]] }))
+                      }
+                    }}
+                  >
+                    <span className="text-dark h6 mb-0">{element[0]}</span>
+                    <span className="badge badge-light ml-2">{(element[1] as any[]).length}</span>
+                    <i className={`fas ml-1 small fa-angle-${collapsedGroups[element[0]] ? 'right' : 'down'}`} aria-hidden="true"></i>
+                  </div>
+                  {!collapsedGroups[element[0]] && element[1]['map']((x, i) => ( // eslint-disable-line dot-notation
                     x.hasWarning ? ( // eslint-disable-next-line  dot-notation
                       <div id={`staticAnalysisModule${element[1]['warningModuleName']}`} key={i}>
                         <ErrorRenderer message={x.msg} opt={x.options} warningErrors={ x.warningErrors} editor={props.analysisModule}/>

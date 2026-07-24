@@ -59,7 +59,7 @@ async function switchNetwork (tl, label) {
     try { await page.locator('button:has-text("I Understand")').click({ timeout: 5000 }) } catch (e) {}
     await page.locator('[data-id="headerWalletConnect"]').waitFor({ timeout: 30000 })
     await page.locator('[data-id="headerWalletConnect"]').click()
-    await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 60000 })
+    await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 60000 })
     await page.waitForFunction(() => /nile/i.test((document.querySelector('[data-id="settingsNetworkEnv"]') || {}).textContent || ''), null, { timeout: 20000 })
     log('connected on nile; arming 429 route')
 

@@ -56,11 +56,16 @@
   align-items: center;
   gap: 8px;
   margin-right: 14px;
+  min-width: 0;
+  flex-shrink: 1;
 }
 .top-header-wrapper .header-right-cluster {
   display: flex;
   align-items: center;
   min-width: 0;
+  /* The workspace switcher is absolutely centered, so reserve its right half
+     plus a 12px gap and let action labels shrink before controls can overlap. */
+  max-width: calc(50% - 242px);
   margin-left: 12px;
 }
 .top-header-wrapper .header-layout-toggles {
@@ -243,6 +248,8 @@
 }
 .top-header-wrapper .header-action-btn {
   height: 30px;
+  width: 100%;
+  min-width: 0;
   max-width: 185px;
   display: inline-flex;
   align-items: center;
@@ -261,6 +268,12 @@
   text-overflow: ellipsis;
   cursor: pointer;
 }
+.top-header-wrapper .header-action-btn > span:not(.header-action-icon) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .top-header-wrapper .header-action-btn:hover {
   border-color: var(--header-control-hover-border);
   color: var(--header-control-text);
@@ -269,6 +282,7 @@
 }
 .top-header-wrapper .header-action-btn .header-action-icon {
   color: var(--header-control-icon);
+  flex: none;
 }
 .top-header-wrapper .header-action-btn:disabled {
   cursor: wait;
@@ -277,6 +291,8 @@
 .top-header-wrapper .header-wallet-action {
   position: relative;
   display: inline-flex;
+  min-width: 30px;
+  flex-shrink: 1;
 }
 .top-header-wrapper .wallet-action-btn span:last-child {
   overflow: hidden;
@@ -334,6 +350,66 @@
   font-weight: 700;
 }
 .top-header-wrapper .wallet-menu-actions button:hover {
+  background: var(--header-menu-primary-hover-bg);
+}
+.top-header-wrapper .header-github-action {
+  position: relative;
+  display: inline-flex;
+  min-width: 30px;
+  flex-shrink: 1;
+}
+.top-header-wrapper .header-github-menu {
+  position: absolute;
+  right: 0;
+  top: 38px;
+  width: 240px;
+  padding: 10px;
+  border: 1px solid var(--header-menu-border);
+  border-radius: 6px;
+  background: var(--header-menu-bg);
+  color: var(--header-menu-text);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22);
+  z-index: 1040;
+}
+.top-header-wrapper .github-menu-title {
+  padding: 2px 4px 8px;
+  color: var(--header-menu-text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.top-header-wrapper .github-menu-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 4px;
+  border-top: 1px solid var(--header-menu-divider);
+  color: var(--header-menu-muted);
+  font-size: 12px;
+}
+.top-header-wrapper .github-menu-row strong {
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--header-menu-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-header-wrapper .github-menu-actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 10px;
+}
+.top-header-wrapper .github-menu-actions button {
+  flex: 1;
+  min-height: 30px;
+  border: 1px solid var(--header-menu-border);
+  border-radius: 5px;
+  background: var(--header-menu-primary-bg);
+  color: var(--header-menu-primary-text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+.top-header-wrapper .github-menu-actions button:hover {
   background: var(--header-menu-primary-hover-bg);
 }
 .top-header-wrapper .header-notifications {
@@ -446,10 +522,18 @@
   margin-right: 12px;
   font-size: 14px;
   line-height: 1;
+  font-family: inherit;
   color: var(--ai-text);
+  background: transparent;
   border: 1px solid var(--ai-input-border);
   padding: 6px 10px;
   border-radius: 4px;
+  cursor: pointer;
+}
+.top-header-wrapper .header-version:hover,
+.top-header-wrapper .header-version:focus-visible {
+  border-color: var(--ai-text);
+  text-decoration: underline;
 }
 
 .top-header-wrapper .ai-show-btn {
@@ -464,6 +548,9 @@
 @media (max-width: 1600px) {
   .top-header-wrapper .header-workspace-menu {
     width: 280px;
+  }
+  .top-header-wrapper .header-right-cluster {
+    max-width: calc(50% - 152px);
   }
 }
 
@@ -480,8 +567,11 @@
   }
 }
 
-@media (max-width: 1120px) {
+@media (max-width: 1200px) {
   .top-header-wrapper .header-workspace-menu {
     display: none;
+  }
+  .top-header-wrapper .header-right-cluster {
+    max-width: none;
   }
 }

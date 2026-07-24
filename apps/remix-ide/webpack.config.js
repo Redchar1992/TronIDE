@@ -99,11 +99,37 @@ class VersionedEntrypointAssetsPlugin {
           (match, pre, asset, post) => `${pre}${asset}?v=${tokenFor(asset)}${post}`)
         if (versionedHtml !== html) fs.writeFileSync(filePath, versionedHtml)
       })
+
+      // Keep assets/version.json in lock-step with package.json on every build.
+      // The header badge reads this file first (header-panel.getLatestVersion),
+      // so a hand-maintained copy silently rots — it showed 2.3.0 long after
+      // package.json moved to 2.3.2. Generating it here makes the deployed
+      // version honest and refreshes the timestamp so a long-lived tab can
+      // detect a new deploy.
+      try {
+        const versionDir = path.join(outputPath, 'assets')
+        fs.mkdirSync(versionDir, { recursive: true })
+        fs.writeFileSync(path.join(versionDir, 'version.json'), JSON.stringify({
+          version: packageJson.version,
+          timestamp: Date.now(),
+          mode: stats.compilation.compiler.options.mode || process.env.NODE_ENV || 'development'
+        }))
+      } catch (e) { /* non-fatal: badge falls back to packageJson.version */ }
     })
   }
 }
 
 module.exports = config => {
+  // @solidity-parser/parser declares `browser: { path: false }`, which makes
+  // webpack resolve its internal require('path') to an empty module — the
+  // parser then calls path.join at load time and throws
+  // "__webpack_require__(...).join is not a function" (breaks the in-editor
+  // linter). An explicit alias overrides the package's browser field and
+  // routes path to the same path-browserify already used as the fallback.
+  config.resolve.alias = {
+    ...config.resolve.alias,
+    path: require.resolve('path-browserify')
+  };
   config.resolve.fallback = {
     ...config.resolve.fallback,
     "querystring": require.resolve("querystring-es3"),
@@ -139,6 +165,10 @@ module.exports = config => {
   }
   config.plugins.push(new VersionedEntrypointAssetsPlugin());
   config.plugins.push(new webpack.DefinePlugin({
+    // @solidity-parser/parser loads its ANTLR tokens via fs.readFileSync
+    // unless a global `BROWSER` is defined, in which case it uses the bundled
+    // tokens. Define it so the parser works in the browser (in-editor linter).
+    BROWSER: JSON.stringify(true),
     'process.env.TRON_PUBLIC_TRONGRID_API_KEY': JSON.stringify(process.env.TRON_PUBLIC_TRONGRID_API_KEY || ''),
     'process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS || ''),
     'process.env.TRONSCAN_NILE_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_NILE_CONTRACT_API_URLS || ''),
@@ -175,7 +205,8 @@ module.exports = config => {
         // two are response-header only (browsers ignore them in <meta>), so the
         // dev server is the only place the app itself can deliver them locally.
         'X-Frame-Options': 'SAMEORIGIN',
-        'X-Content-Type-Options': 'nosniff'
+        'X-Content-Type-Options': 'nosniff',
+        'Strict-Transport-Security': 'max-age=31536000'
       }
     };
   }

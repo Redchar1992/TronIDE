@@ -23,14 +23,22 @@ import ReactDOM from 'react-dom'
 import { EventEmitter } from 'events'
 import {RemixUiStaticAnalyser} from '@remix-ui/static-analyser' // eslint-disable-line
 import * as packageJson from '../../../../../package.json'
+const StaticAnalysisRunner = require('@remix-project/remix-analyzer').CodeAnalysis
 var Renderer = require('../ui/renderer')
 
 var EventManager = require('../../lib/events')
 
+// Mirrors the panel's library heuristic (remix-ui-static-analyser isLibraryFile):
+// findings in imported dependencies are noise the user didn't write.
+const isLibraryFile = (fileName) => !!fileName && (fileName.startsWith('@') || /(^|\/)(\.deps|node_modules)\//.test(fileName))
+
 const profile = {
   name: 'solidityStaticAnalysis',
   displayName: 'Solidity static analysis',
-  methods: [],
+  // `analyze` runs the Remix static-analysis modules over the last compilation
+  // and returns a compact findings list (used by the AI assistant's
+  // run_static_analysis tool). Read-only; no editor/UI side effects.
+  methods: ['analyze'],
   events: [],
   icon: 'assets/img/staticAnalysis.webp',
   description: 'Checks the contract code for security vulnerabilities and bad practices.',
@@ -60,6 +68,63 @@ class AnalysisTab extends ViewPlugin {
 
   onActivation () {
     this.renderComponent()
+  }
+
+  /**
+   * Run the Remix static-analysis modules over the most recent compilation and
+   * return a compact, machine-readable findings list. Read-only: it does not
+   * touch the editor or the panel UI. Library findings (imported deps) are
+   * excluded by default, matching the panel's default toggle.
+   * @param {{ includeLibraries?: boolean }} [opts]
+   */
+  async analyze (opts = {}) {
+    const includeLibraries = !!opts.includeLibraries
+    let last
+    try { last = await this.call('compilerArtefacts', 'get', '__last') } catch (e) { last = null }
+    if (!last || typeof last.getData !== 'function') {
+      return { ok: false, message: 'No compilation result yet — compile a contract first, then analyze.' }
+    }
+    const compilationResult = last.getData()
+    const compilationSource = last.getSourceCode ? last.getSourceCode() : { sources: (compilationResult && compilationResult.sources) || {} }
+    if (!compilationResult || !compilationResult.sources) {
+      return { ok: false, message: 'The last compilation produced no AST to analyze.' }
+    }
+    const runner = new StaticAnalysisRunner()
+    const moduleCount = runner.modules().length
+    const toRun = Array.from({ length: moduleCount }, (_, i) => i)
+    const sourceKeys = Object.keys(compilationResult.sources)
+
+    const reports = await new Promise((resolve) => {
+      try { runner.run(compilationResult, toRun, resolve) } catch (e) { resolve([]) }
+    })
+
+    const findings = []
+    let hidden = 0
+    for (const result of reports) {
+      for (const item of (result.report || [])) {
+        let fileName = sourceKeys[0] || ''
+        let locationString = ''
+        if (item.location) {
+          const split = String(item.location).split(':')
+          const fileIndex = parseInt(split[2], 10)
+          fileName = sourceKeys[fileIndex] || fileName
+          try {
+            const loc = this._deps.offsetToLineColumnConverter.offsetToLineColumn(
+              { start: parseInt(split[0], 10), length: parseInt(split[1], 10) },
+              fileIndex, compilationSource.sources, compilationResult.sources)
+            locationString = (loc.start.line + 1) + ':' + loc.start.column
+          } catch (e) { locationString = '' }
+        }
+        if (!includeLibraries && isLibraryFile(fileName)) { hidden++; continue }
+        findings.push({
+          type: result.name,
+          file: fileName,
+          location: locationString,
+          warning: String(item.warning || '').replace(/<[^>]*>/g, '').trim().slice(0, 400)
+        })
+      }
+    }
+    return { ok: true, findings, count: findings.length, hiddenLibraryFindings: hidden }
   }
 
   render () {

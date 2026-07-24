@@ -32,7 +32,7 @@ const TestTabLogic = require('./testTab/testTab')
 const profile = {
   name: 'solidityUnitTesting',
   displayName: 'Solidity unit testing',
-  methods: ['testFromPath', 'testFromSource'],
+  methods: ['testFromPath', 'testFromSource', 'aiRunTests'],
   events: [],
   icon: 'assets/img/unitTesting.webp',
   description: 'Fast tool to generate unit tests for your contracts',
@@ -57,6 +57,21 @@ module.exports = class TestTab extends ViewPlugin {
     this.areTestsRunning = false
     this.defaultPath = 'tests'
     this.offsetToLineColumnConverter = offsetToLineColumnConverter
+    // filePanel can emit setWorkspace synchronously while this plugin is being
+    // activated. The event subscription is installed before render creates the
+    // path input and datalist, so queue refreshes until the complete view exists.
+    // A second event received while an async refresh is running is drained in a
+    // following pass instead of being lost or racing the first refresh.
+    this._viewReady = false
+    this._workspaceRefreshPending = false
+    this._workspaceRefreshPromise = null
+    this._dirListRequestId = 0
+    this._eventsListening = false
+    // EventEmitter requires the exact same function reference for removal.
+    // Keep stable handlers across deactivate/reactivate cycles so listeners do
+    // not accumulate and issue concurrent refreshes against a later view.
+    this._onNoFileSelected = () => this.updateForNewCurrent()
+    this._onCurrentFileChanged = (file) => this.updateForNewCurrent(file)
 
     appManager.event.on('activate', (name) => {
       if (name === 'solidity') this.updateRunAction()
@@ -66,18 +81,31 @@ module.exports = class TestTab extends ViewPlugin {
     })
   }
 
-  onActivationInternal () {
+  onActivationInternal (rendering = false) {
+    // ViewPlugin may retain the existing DOM across deactivate/reactivate. In
+    // that lifecycle render() is not called again, so the cached input/list
+    // become ready immediately and still need a fresh workspace refresh.
+    this._viewReady = !rendering && Boolean(this._view.el && this.inputPath && this.uiPathList)
     this.testTabLogic = new TestTabLogic(this.fileManager)
+    this.testTabLogic.setCurrentPath(this.defaultPath)
     this.listenToEvents()
+    if (this._viewReady) this.requestWorkspaceRefresh()
   }
 
   onDeactivation () {
+    this._viewReady = false
+    this._workspaceRefreshPending = false
+    this._dirListRequestId++
     this.off('filePanel', 'newTestFileCreated')
     this.off('filePanel', 'setWorkspace')
-    this.fileManager.events.removeListener('currentFileChanged', this.updateForNewCurrent)
+    this.fileManager.events.removeListener('noFileSelected', this._onNoFileSelected)
+    this.fileManager.events.removeListener('currentFileChanged', this._onCurrentFileChanged)
+    this._eventsListening = false
   }
 
   listenToEvents () {
+    if (this._eventsListening) return
+    this._eventsListening = true
     this.on('filePanel', 'newTestFileCreated', async file => {
       try {
         await this.testTabLogic.getTests((error, tests) => {
@@ -94,19 +122,45 @@ module.exports = class TestTab extends ViewPlugin {
       }
     })
 
-    this.on('filePanel', 'setWorkspace', async () => {
-      this.testTabLogic.setCurrentPath(this.defaultPath)
-      this.inputPath.value = this.defaultPath
-      this.updateDirList(this.defaultPath)
-      await this.updateForNewCurrent()
-    })
+    this.on('filePanel', 'setWorkspace', () => this.requestWorkspaceRefresh())
 
     // Closing the last file emits only noFileSelected (not currentFileChanged), so
     // an empty handler left the Run button and test list stale on the previous
     // file. Refresh to the no-file state (disables Run, "No solidity file selected").
-    this.fileManager.events.on('noFileSelected', () => this.updateForNewCurrent())
+    this.fileManager.events.on('noFileSelected', this._onNoFileSelected)
 
-    this.fileManager.events.on('currentFileChanged', (file, provider) => this.updateForNewCurrent(file))
+    this.fileManager.events.on('currentFileChanged', this._onCurrentFileChanged)
+  }
+
+  requestWorkspaceRefresh () {
+    this._workspaceRefreshPending = true
+    if (!this._viewReady) return this._workspaceRefreshPromise || Promise.resolve()
+    if (!this._workspaceRefreshPromise) {
+      // Start on a microtask so the promise is assigned before drain begins.
+      // Without this boundary, a synchronous setWorkspace raised by the first
+      // refresh can observe a null promise and start a concurrent second drain.
+      this._workspaceRefreshPromise = Promise.resolve()
+        .then(() => this.drainWorkspaceRefresh())
+        .catch((error) => console.error('[solidityUnitTesting] workspace refresh failed', error))
+        .finally(() => {
+          this._workspaceRefreshPromise = null
+          // If the current pass failed after another setWorkspace event was
+          // queued, start a fresh pass rather than stranding that update.
+          if (this._viewReady && this._workspaceRefreshPending) this.requestWorkspaceRefresh()
+        })
+    }
+    return this._workspaceRefreshPromise
+  }
+
+  async drainWorkspaceRefresh () {
+    while (this._viewReady && this._workspaceRefreshPending) {
+      this._workspaceRefreshPending = false
+      this.testTabLogic.setCurrentPath(this.defaultPath)
+      this.inputPath.value = this.defaultPath
+      await this.updateDirList(this.defaultPath)
+      if (!this._viewReady) return
+      await this.updateForNewCurrent()
+    }
   }
 
   async updateForNewCurrent (file) {
@@ -405,6 +459,65 @@ module.exports = class TestTab extends ViewPlugin {
     return this.testFromSource(fileContent, path)
   }
 
+  // Programmatic test run for the AI assistant. `path` is an optional single
+  // *_test.sol file or a directory of them; it defaults to the `tests` folder.
+  // Each file runs through the same remix-tests pipeline the panel's Run button
+  // uses (compile + deploy on the JS VM + assert), and the per-file results are
+  // aggregated into one pass/fail summary the model can report and act on.
+  async aiRunTests ({ path } = {}) {
+    if (!this.testTabLogic) this.testTabLogic = new TestTabLogic(this.fileManager)
+    const target = (path && String(path).trim()) || this.defaultPath
+
+    let files = []
+    const isTestFile = (p) => /_test\.sol$/.test(p)
+    if (await this.fileManager.exists(target)) {
+      if (await this.fileManager.isDirectory(target)) {
+        let entries = []
+        try { entries = await this.fileManager.readdir(target) } catch (e) { entries = [] }
+        files = Object.keys(entries || {}).filter(isTestFile)
+      } else if (isTestFile(target)) {
+        files = [target]
+      } else {
+        return { ok: false, message: `"${target}" is not a Solidity test file — test files end in _test.sol.` }
+      }
+    } else {
+      return { ok: false, message: `Path "${target}" was not found in the workspace.` }
+    }
+    if (!files.length) {
+      return { ok: false, message: `No _test.sol files found in "${target}". Create tests (they end in _test.sol) or point run_tests at a specific file.` }
+    }
+
+    let totalPassing = 0
+    let totalFailing = 0
+    const failures = []
+    const compileErrors = []
+    for (const file of files) {
+      let result
+      try {
+        result = await this.testFromPath(file)
+      } catch (e) {
+        // A compile/deploy failure rejects the whole file — surface it instead
+        // of throwing so the other files still run and the model sees the cause.
+        compileErrors.push({ file, message: (e && (e.message || String(e))) || 'test run failed' })
+        continue
+      }
+      totalPassing += result.totalPassing || 0
+      totalFailing += result.totalFailing || 0
+      for (const err of (result.errors || [])) {
+        failures.push({ file, test: err.context || '', message: err.message || String(err.value || '') })
+      }
+    }
+
+    return {
+      ok: totalFailing === 0 && compileErrors.length === 0,
+      files: files.length,
+      totalPassing,
+      totalFailing,
+      failures,
+      compileErrors
+    }
+  }
+
   /*
     Test is not associated with the UI
   */
@@ -531,7 +644,7 @@ module.exports = class TestTab extends ViewPlugin {
         class="btn border w-50"
         data-id="testTabGenerateTestFile"
         title="Generate sample test file."
-        onclick="${this.testTabLogic.generateTestFile.bind(this.testTabLogic)}"
+        onclick=${this.testTabLogic.generateTestFile.bind(this.testTabLogic)}
       >
         Generate
       </button>
@@ -618,11 +731,15 @@ module.exports = class TestTab extends ViewPlugin {
     return yo`<span class='text-info h6'>Progress: ${ready} finished (of ${this.runningTestsNumber})</span>`
   }
 
-  updateDirList (path) {
-    for (const o of this.uiPathList.querySelectorAll('option')) o.remove()
-    this.testTabLogic.dirList(path).then((options) => {
-      options.forEach((path) => this.uiPathList.appendChild(yo`<option>${path}</option>`))
-    })
+  async updateDirList (path) {
+    const requestId = ++this._dirListRequestId
+    const target = this.uiPathList
+    for (const o of target.querySelectorAll('option')) o.remove()
+    const options = await this.testTabLogic.dirList(path)
+    // A later workspace/path refresh owns the list now. Discard this result so
+    // a slow response from the previous workspace cannot append stale options.
+    if (requestId !== this._dirListRequestId || target !== this.uiPathList) return
+    options.forEach((path) => target.appendChild(yo`<option>${path}</option>`))
   }
 
   trimTestDirInput (input) {
@@ -686,13 +803,15 @@ module.exports = class TestTab extends ViewPlugin {
   }
 
   render () {
-    this.onActivationInternal()
+    this._viewReady = false
+    this.onActivationInternal(true)
     this.testsOutput = yo`<div class="mx-3 mb-2 pb-4 border-top border-primary" hidden='true' id="solidityUnittestsOutput" data-id="testTabSolidityUnitTestsOutput"></a>`
     this.testsExecutionStopped = yo`<label class="text-warning h6" data-id="testTabTestsExecutionStopped">The test execution has been stopped</label>`
     this.testsExecutionStoppedError = yo`<label class="text-danger h6" data-id="testTabTestsExecutionStoppedError">The test execution has been stopped because of error(s) in your test file</label>`
     this.uiPathList = yo`<datalist id="utPathList"></datalist>`
     this.inputPath = yo`<input
       placeholder=${this.defaultPath}
+      value=${this.defaultPath}
       list="utPathList"
       class="${css.inputFolder} custom-select"
       id="utPath"
@@ -759,8 +878,8 @@ module.exports = class TestTab extends ViewPlugin {
       </div>
     `
     this._view.el = el
-    this.testTabLogic.setCurrentPath(this.defaultPath)
-    this.updateForNewCurrent(this.fileManager.currentFile())
+    this._viewReady = true
+    this.requestWorkspaceRefresh()
     return el
   }
 }

@@ -53,6 +53,12 @@ export default class staticAnalysisRunner {
     let reports: AnalysisReport[] = []
     // Also provide convenience analysis via the AST walker.
     const walker = new AstWalker()
+    // A module can choke on a node/construct it doesn't model (e.g. modern
+    // OpenZeppelin under the older analyzer). The walk visits every node, so a
+    // per-node throw used to flood the panel with scary, unactionable
+    // "INTERNAL ERROR" rows. Log once per module and skip it instead — the
+    // other modules' findings are unaffected.
+    const erroredModules = new Set<string>()
     for (const k in compilationResult.sources) {
       walker.walkFull(compilationResult.sources[k].ast,
         (node: any) => {
@@ -61,9 +67,10 @@ export default class staticAnalysisRunner {
               try {
                 item.mod.visit(node)
               } catch (e) {
-                reports.push({
-                  name: item.name, report: [{ warning: 'INTERNAL ERROR in module ' + item.name + ' ' + e.message, error: e.stack }]
-                })
+                if (!erroredModules.has(item.name)) {
+                  erroredModules.add(item.name)
+                  console.debug('[static-analysis] module "' + item.name + '" failed on a node; skipping it:', e && e.message)
+                }
               }
             }
           })
@@ -79,7 +86,8 @@ export default class staticAnalysisRunner {
       try {
         report = item.mod.report(compilationResult)
       } catch (e) {
-        report = [{ warning: 'INTERNAL ERROR in module ' + item.name + ' ' + e.message, error: e.stack }]
+        console.debug('[static-analysis] module "' + item.name + '" report() failed; skipping it:', e && e.message)
+        report = []
       }
       return { name: item.name, report: report }
     }))

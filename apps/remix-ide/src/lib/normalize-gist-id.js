@@ -19,10 +19,9 @@
 
 'use strict'
 
-// Extract a bare gist id from a raw param that may be a full gist URL or a plain
-// id. Mirrors gist-handler's own `getGistId` (16-40 hex chars) so a normalized id
-// can be compared like-for-like against `provider.lastLoadedGistId` (the bare id
-// gist-handler records after a successful load).
+// Extract a bare gist id from a raw param that may be a canonical gist.github.com
+// URL or a plain id. Do not search for an id-shaped substring: doing so lets
+// attacker-controlled prefixes/suffixes and query values pass validation.
 //
 // Three-way return — callers rely on the '' vs null distinction:
 //   ''   -> no gist param at all (absent/empty)            => do nothing
@@ -30,8 +29,18 @@
 //   id   -> the matched bare gist id
 function normalizeGistId (raw) {
   if (raw === undefined || raw === null || raw === '') return ''
-  const match = /[0-9A-Fa-f]{16,40}/.exec(String(raw))
-  return match ? match[0] : null
+  const value = String(raw).trim()
+  const idPattern = /^[0-9A-Fa-f]{20,40}$/
+  if (idPattern.test(value)) return value
+
+  let parsed
+  try { parsed = new URL(value) } catch (e) { return null }
+  if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'gist.github.com' ||
+      parsed.username || parsed.password || parsed.port || parsed.search) return null
+  const parts = parsed.pathname.split('/').filter(Boolean)
+  if (parts.length !== 1 && parts.length !== 2) return null
+  const id = parts[parts.length - 1]
+  return idPattern.test(id) ? id : null
 }
 
 module.exports = normalizeGistId

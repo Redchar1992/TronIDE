@@ -24,6 +24,9 @@ import { ModalDialog } from '@remix-ui/modal-dialog' // eslint-disable-line
 import { Toaster } from '@remix-ui/toaster'// eslint-disable-line
 import { MenuItems } from 'libs/remix-ui/file-explorer/src/lib/types'
 import { Tooltip } from 'antd'
+import { workspace as remixLibWorkspace } from '@remix-project/remix-lib'
+
+const TRON_TEMPLATES = (remixLibWorkspace && remixLibWorkspace.tronTemplates && remixLibWorkspace.tronTemplates.TRON_TEMPLATES) || []
 declare global {
   interface Window {
     gtag: (
@@ -36,9 +39,9 @@ declare global {
 
 /* eslint-disable-next-line */
 export interface WorkspaceProps {
-  setWorkspace: (workspace: { name: string, isLocalhost: boolean }, setEvent: boolean) => void,
-  createWorkspace: (name: string) => void,
-  renameWorkspace: (oldName: string, newName: string) => void
+  setWorkspace: (workspace: { name: string, isLocalhost: boolean }, setEvent: boolean, syncComponent?: boolean, mutationToken?: number) => void,
+  createWorkspace: (name: string, templateId?: string | boolean, mutationToken?: number) => void,
+  renameWorkspace: (oldName: string, newName: string, mutationToken?: number) => void
   workspaceRenamed: (workspace: { name: string }) => void,
   workspaceCreated: (workspace: { name: string }) => void,
   workspaceDeleted: (workspace: { name: string }) => void,
@@ -59,6 +62,10 @@ var canUpload = window.File || window.FileReader || window.FileList || window.Bl
 export const Workspace = (props: WorkspaceProps) => {
   const LOCALHOST = ' - connect to localhost - '
   const NO_WORKSPACE = ' - none - '
+  // Event listeners below are installed once. Keep the desired workspace in a
+  // ref so a later remixd disconnect does not read the initial render's stale
+  // NO_WORKSPACE value and clear a browser workspace the user just selected.
+  const currentWorkspaceRef = useRef(NO_WORKSPACE)
 
   /* extends the parent 'plugin' with some function needed by the file explorer */
   props.plugin.resetFocus = (reset) => {
@@ -80,8 +87,8 @@ export const Workspace = (props: WorkspaceProps) => {
     return createWorkspace()
   }
 
-  props.request.setWorkspace = (workspaceName) => {
-    return setWorkspace(workspaceName)
+  props.request.setWorkspace = (workspaceName, mutationToken) => {
+    return setWorkspace(workspaceName, mutationToken)
   }
 
   props.request.createNewFile = async () => {
@@ -107,6 +114,7 @@ export const Workspace = (props: WorkspaceProps) => {
         if (props.workspaces.length > 0 && state.currentWorkspace === NO_WORKSPACE) {
           const currentWorkspace = props.workspace.getWorkspace() ? props.workspace.getWorkspace() : props.workspaces[0]
           await props.workspace.setWorkspace(currentWorkspace)
+          currentWorkspaceRef.current = currentWorkspace
           setState(prevState => {
             return { ...prevState, workspaces: props.workspaces, currentWorkspace }
           })
@@ -126,25 +134,17 @@ export const Workspace = (props: WorkspaceProps) => {
   }, [props.workspaces])
 
   const localhostDisconnect = () => {
-    if (state.currentWorkspace === LOCALHOST) setWorkspace(props.workspaces.length > 0 ? props.workspaces[0] : NO_WORKSPACE)
-    // This should be removed some time after refactoring: https://github.com/ethereum/remix-project/issues/1197
-    else {
-      setWorkspace(state.currentWorkspace) // Useful to switch to last selcted workspace when remixd is disconnected
-      props.fileManager.setMode('browser')
-    }
+    if (currentWorkspaceRef.current === LOCALHOST) {
+      setWorkspace(props.workspaces.length > 0 ? props.workspaces[0] : NO_WORKSPACE)
+    } else remixdExplorer.hide()
   }
 
   useEffect(() => {
     props.localhost.event.off('disconnected', localhostDisconnect)
     props.localhost.event.on('disconnected', localhostDisconnect)
     props.localhost.event.on('connected', () => {
-      props.fileManager.closeAllFiles()
       remixdExplorer.show()
       setWorkspace(LOCALHOST)
-    })
-
-    props.localhost.event.on('disconnected', () => {
-      remixdExplorer.hide()
     })
 
     props.localhost.event.on('loading', () => {
@@ -157,6 +157,7 @@ export const Workspace = (props: WorkspaceProps) => {
 
     if (props.initialWorkspace) {
       props.workspace.setWorkspace(props.initialWorkspace)
+      currentWorkspaceRef.current = props.initialWorkspace
       setState(prevState => {
         return { ...prevState, currentWorkspace: props.initialWorkspace }
       })
@@ -164,14 +165,18 @@ export const Workspace = (props: WorkspaceProps) => {
   }, [])
 
   const createNewWorkspace = async (workspaceName) => {
+    let mutationToken
     try {
+      mutationToken = props.fileManager.beginWorkspaceMutation('create workspaces')
       await props.fileManager.closeAllFiles()
-      await props.createWorkspace(workspaceName)
-      await setWorkspace(workspaceName)
+      await props.createWorkspace(workspaceName, true, mutationToken)
+      await setWorkspace(workspaceName, mutationToken)
       toast('New default workspace has been created.')
     } catch (e) {
       modalMessage('Create Default Workspace', e.message)
       console.error(e)
+    } finally {
+      if (mutationToken !== undefined) props.fileManager.endWorkspaceMutation(mutationToken)
     }
   }
 
@@ -225,6 +230,7 @@ export const Workspace = (props: WorkspaceProps) => {
 
   const workspaceRenameInput = useRef()
   const workspaceCreateInput = useRef()
+  const workspaceCreateTemplateInput = useRef()
 
   const onFinishRenameWorkspace = async () => {
     if (workspaceRenameInput.current === undefined) return
@@ -234,13 +240,17 @@ export const Workspace = (props: WorkspaceProps) => {
       modalMessage('Rename Workspace', 'Rename failed, special characters are not allowed')
       return
     }
+    let mutationToken
     try {
-      await props.renameWorkspace(state.currentWorkspace, workspaceName)
-      setWorkspace(workspaceName)
+      mutationToken = props.fileManager.beginWorkspaceMutation('rename workspaces')
+      await props.renameWorkspace(state.currentWorkspace, workspaceName, mutationToken)
+      await setWorkspace(workspaceName, mutationToken)
       props.workspaceRenamed({ name: workspaceName })
     } catch (e) {
       modalMessage('Rename Workspace', e.message)
       console.error(e)
+    } finally {
+      if (mutationToken !== undefined) props.fileManager.endWorkspaceMutation(mutationToken)
     }
   }
 
@@ -252,23 +262,40 @@ export const Workspace = (props: WorkspaceProps) => {
       modalMessage('Create Workspace', 'Creation failed, special characters are not allowed')
       return
     }
+    // @ts-ignore: Object is possibly 'null'.
+    const templateId = workspaceCreateTemplateInput.current ? workspaceCreateTemplateInput.current.value : ''
+    let mutationToken
     try {
+      mutationToken = props.fileManager.beginWorkspaceMutation('create workspaces')
       await props.fileManager.closeAllFiles()
-      await props.createWorkspace(workspaceName)
-      await setWorkspace(workspaceName)
+      await props.createWorkspace(workspaceName, templateId || undefined, mutationToken)
+      await setWorkspace(workspaceName, mutationToken)
+      const picked = templateId ? TRON_TEMPLATES.find((template) => template.id === templateId) : null
+      if (picked) await props.fileManager.openFile(picked.path)
     } catch (e) {
       modalMessage('Create Workspace', e.message)
       console.error(e)
+    } finally {
+      if (mutationToken !== undefined) props.fileManager.endWorkspaceMutation(mutationToken)
     }
   }
 
   const onFinishDeleteWorkspace = async () => {
-    await props.fileManager.closeAllFiles()
-    const workspacesPath = props.workspace.workspacesPath
-    props.browser.remove(workspacesPath + '/' + state.currentWorkspace)
-    const name = state.currentWorkspace
-    setWorkspace(NO_WORKSPACE)
-    props.workspaceDeleted({ name })
+    let mutationToken
+    try {
+      mutationToken = props.fileManager.beginWorkspaceMutation('delete workspaces')
+      await props.fileManager.closeAllFiles()
+      const workspacesPath = props.workspace.workspacesPath
+      await props.browser.remove(workspacesPath + '/' + state.currentWorkspace)
+      const name = state.currentWorkspace
+      await setWorkspace(NO_WORKSPACE, mutationToken)
+      props.workspaceDeleted({ name })
+    } catch (e) {
+      modalMessage('Delete Workspace', e.message)
+      console.error(e)
+    } finally {
+      if (mutationToken !== undefined) props.fileManager.endWorkspaceMutation(mutationToken)
+    }
   }
   /** ** ****/
 
@@ -278,37 +305,43 @@ export const Workspace = (props: WorkspaceProps) => {
     })
   }
 
-  const setWorkspace = async (name) => {
-    await props.fileManager.closeAllFiles()
-    if (name === LOCALHOST) {
-      props.workspace.clearWorkspace()
-    } else if (name === NO_WORKSPACE) {
-      props.workspace.clearWorkspace()
-    } else {
-      await props.workspace.setWorkspace(name)
+  const setWorkspace = async (name, activeMutationToken?) => {
+    let mutationToken = activeMutationToken
+    const ownsMutation = mutationToken === undefined
+    if (ownsMutation) mutationToken = props.fileManager.beginWorkspaceMutation('switch workspaces')
+    else props.fileManager.assertWorkspaceMutationToken(mutationToken)
+    try {
+      // Publish the user's destination before deactivating remixd. Its
+      // `disconnected` event fires during this call and must not mistake the
+      // transition for an unexpected localhost disconnect.
+      currentWorkspaceRef.current = name
+      await props.fileManager.closeAllFiles()
+      if (name === LOCALHOST) {
+        props.workspace.clearWorkspace()
+      } else if (name === NO_WORKSPACE) {
+        props.workspace.clearWorkspace()
+      } else {
+        await props.workspace.setWorkspace(name)
+      }
+      await props.setWorkspace({ name, isLocalhost: name === LOCALHOST }, !(name === LOCALHOST || name === NO_WORKSPACE), false, mutationToken)
+      props.plugin.getWorkspaces()
+      setState(prevState => {
+        return { ...prevState, currentWorkspace: name }
+      })
+    } finally {
+      if (ownsMutation) props.fileManager.endWorkspaceMutation(mutationToken)
     }
-    await props.setWorkspace({ name, isLocalhost: name === LOCALHOST }, !(name === LOCALHOST || name === NO_WORKSPACE))
-    props.plugin.getWorkspaces()
-    setState(prevState => {
-      return { ...prevState, currentWorkspace: name }
-    })
   }
 
   const remixdExplorer = {
-    hide: async () => {
-      // If 'connect to localhost' is clicked from home tab, mode is not 'localhost'
-      // if (props.fileManager.mode === 'localhost') {
-      await setWorkspace(NO_WORKSPACE)
+    hide: () => {
+      // Hiding the localhost tree is a view update only. The disconnect handler
+      // chooses a fallback when localhost was active; clearing the workspace
+      // here as well raced that fallback and emitted a duplicate create event.
       props.fileManager.setMode('browser')
       setState(prevState => {
         return { ...prevState, hideRemixdExplorer: true, loadingLocalhost: false }
       })
-      // } else {
-      //   // Hide spinner in file explorer
-      //   setState(prevState => {
-      //     return { ...prevState, loadingLocalhost: false }
-      //   })
-      // }
     },
     show: () => {
       props.fileManager.setMode('localhost')
@@ -353,6 +386,13 @@ export const Workspace = (props: WorkspaceProps) => {
       <>
         <span>{ state.modal.message }</span>
         <input type="text" data-id="modalDialogCustomPromptTextCreate" defaultValue={`workspace_${Date.now()}`} ref={workspaceCreateInput} className="form-control" />
+        <label className="form-check-label mt-2" htmlFor="wsTemplateSelect">Template</label>
+        <select id="wsTemplateSelect" data-id="modalDialogCustomSelectTemplate" defaultValue="" ref={workspaceCreateTemplateInput} className="form-control custom-select">
+          <option value="">Default (sample contracts)</option>
+          { TRON_TEMPLATES.map((template) => (
+            <option key={template.id} value={template.id} title={template.description}>{template.name}</option>
+          )) }
+        </select>
       </>
     )
   }
@@ -389,7 +429,7 @@ export const Workspace = (props: WorkspaceProps) => {
                 Workspaces
               </label>
               <span className="remixui_menu">
-                <Tooltip title="Create workspace using default template">
+                <Tooltip title="Create workspace from a template">
                   <span
                     id='workspaceCreate'
                     data-id='workspaceCreate'

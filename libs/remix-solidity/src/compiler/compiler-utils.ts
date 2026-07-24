@@ -23,6 +23,14 @@ const minixhr = require('minixhr')
 
 export const baseURLBin = 'https://binaries.soliditylang.org/bin'
 export const baseURLWasm = 'https://binaries.soliditylang.org/wasm'
+// The solc version of the BUNDLED fallback compiler (apps/remix-ide/src/assets/
+// js/soljson.js). Every user-facing "built-in compiler (x.y.z)" string and the
+// builtin pragma-matching MUST use this constant: the asset was once 0.8.6 and
+// the hardcoded labels silently went stale when it was swapped for 0.8.20.
+// Keep in sync when replacing the asset — TC-CMP-VER-008 compiles the builtin
+// and fails if the binary reports a different version, and
+// scripts/check-compiler-source-consistency.cjs pins the mirrors.
+export const BUILTIN_SOLC_VERSION = '0.8.20'
 // export const baseURLTron = 'https://tronsuper.github.io/tron-solc-bin/bin'
 export const tronCompilerSourceProvider = {
   baseURL: 'https://tronprotocol.github.io/solc-bin/wasm',
@@ -60,10 +68,34 @@ export function compilerSourceMockMode () {
   return hashParams.get(compilerSourceMockParam) || searchParams.get(compilerSourceMockParam) || window.localStorage.getItem(compilerSourceMockParam) || ''
 }
 
+// `window` only exists on the main thread, but this check also runs inside the
+// compiler web worker (compiler-worker re-validates before importScripts).
+// Basing same-origin detection on `window` silently disabled the same-origin
+// carve-outs there, so the worker rejected the app's own builtin compiler —
+// the very build every offline/failure path falls back to. `self.location` is
+// available on both the main thread and in workers; neither exists in node
+// (remix-tests), where the provider base URL fallback keeps applying.
+function executionScopeHref (): string | null {
+  if (typeof self !== 'undefined' && self.location && self.location.href) return self.location.href
+  if (typeof window !== 'undefined') return window.location.href
+  return null
+}
+
 export function assertAllowedCompilerURL (url) {
-  const parsed = new URL(url, typeof window !== 'undefined' ? window.location.href : tronCompilerSourceProvider.baseURL)
-  const sameOrigin = typeof window !== 'undefined' && parsed.origin === window.location.origin
-  if (sameOrigin && parsed.pathname.indexOf('/__remix_mock_compiler_source_') === 0 && isCompilerSourceMockEnabled()) return parsed.href
+  const scopeHref = executionScopeHref()
+  const parsed = new URL(url, scopeHref || tronCompilerSourceProvider.baseURL)
+  const sameOrigin = !!scopeHref && parsed.origin === new URL(scopeHref).origin
+  // The mock opt-in flag lives in window/localStorage, which a worker cannot
+  // read. Inside a worker the main thread has already enforced the opt-in
+  // (Compiler.loadVersion validates before postMessage), so same-origin plus
+  // the reserved mock path prefix is sufficient there.
+  const mockAllowed = typeof window !== 'undefined' ? isCompilerSourceMockEnabled() : true
+  if (sameOrigin && parsed.pathname.indexOf('/__remix_mock_compiler_source_') === 0 && mockAllowed) return parsed.href
+  // The app's own bundled builtin compiler (assets/js/soljson.js) is served
+  // same-origin and is as trustworthy as the app itself. It is the offline
+  // fallback when the version list is unreachable; rejecting it made that
+  // fallback throw "origin is not allowed".
+  if (sameOrigin && /\/assets\/js\/soljson\.js$/.test(parsed.pathname)) return parsed.href
   if (!ALLOWED_COMPILER_ORIGINS.includes(parsed.origin)) {
     throw new Error(`Compiler URL origin is not allowed: ${parsed.origin}`)
   }

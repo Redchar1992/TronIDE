@@ -20,6 +20,11 @@ import './index.css';
 import './fonts/iconfont.js'
 import UsageIntroductionModal from './components/UsageIntroductionModal';
 
+// Re-exported so other parts of the IDE (e.g. the editor's AI completer and
+// inline-`//` request) can reuse the same lightweight completion helper without
+// reaching into internal service paths.
+export { complete } from './services/toolsApi';
+
 const defaultGPTV='gpt-4';
 class CodeReader extends Component{
     constructor(props){

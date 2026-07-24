@@ -206,6 +206,20 @@ export const DebuggerUI = (props: DebuggerUIProps) => {
       return
     }
 
+    if (debuggerModule.getDebugTraceCapability) {
+      const traceCapability = await debuggerModule.getDebugTraceCapability()
+      if (!traceCapability.supported) {
+        setState((prevState) => {
+          return {
+            ...prevState,
+            debugging: false,
+            validationError: traceCapability.message || 'Step debugging is unavailable for the current provider.'
+          }
+        })
+        return
+      }
+    }
+
     const web3 = await debuggerModule.getDebugWeb3()
     try {
       const networkId = await web3.eth.net.getId()

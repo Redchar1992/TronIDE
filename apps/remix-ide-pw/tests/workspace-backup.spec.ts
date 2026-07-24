@@ -42,7 +42,7 @@ async function exportBackupZip (page: Page, destPath: string) {
   expect(fs.existsSync(destPath)).toBe(true)
 }
 
-async function restoreBackupZip (page: Page, zipPath: string, expectInLog: string) {
+async function restoreBackupZip (page: Page, zipPath: string, expectInLog: string, maxWriteFilePrompts = Infinity) {
   await page.locator('#icon-panel div[plugin="pluginManager"]').click()
   const search = page.locator('[data-id="pluginManagerComponentSearchInput"]')
   await search.waitFor({ state: 'visible', timeout: 5000 })
@@ -60,13 +60,31 @@ async function restoreBackupZip (page: Page, zipPath: string, expectInLog: strin
 
   // Accept permission/confirm modals in the parent while importing.
   let importing = true
+  let writeFilePermissionAccepts = 0
   const clicker = (async () => {
-    while (importing) {
+    while (true) {
+      if (!importing) break
       try {
         const remember = page.locator('#remember')
-        if (await remember.isVisible() && !await remember.isChecked()) await remember.click()
+        const permissionVisible = await remember.isVisible()
+        let isWriteFilePermission = false
+        if (permissionVisible) {
+          const message = await page.locator('[data-id="permissionHandlerMessage"]').textContent()
+          isWriteFilePermission = Boolean(message && message.includes('"writeFile"'))
+          // For the regression test, leave any unexpected second writeFile
+          // prompt unanswered. The second import can finish only when the
+          // remembered first decision is actually reused.
+          if (isWriteFilePermission && writeFilePermissionAccepts >= maxWriteFilePrompts) {
+            await page.waitForTimeout(300)
+            continue
+          }
+          if (!await remember.isChecked()) await remember.click()
+        }
         const ok = page.locator('#modal-footer-ok')
-        if (await ok.isVisible()) await ok.click()
+        if (await ok.isVisible()) {
+          if (isWriteFilePermission) writeFilePermissionAccepts++
+          await ok.click()
+        }
       } catch (e) { /* ignore */ }
       await page.waitForTimeout(300)
     }
@@ -78,11 +96,31 @@ async function restoreBackupZip (page: Page, zipPath: string, expectInLog: strin
     importing = false
     await clicker
   }
+  return writeFilePermissionAccepts
 }
 
 test.beforeAll(() => fs.mkdirSync(tmpDir, { recursive: true }))
 
 test.describe('Workspace backup integrity', () => {
+  test('TRONIDE-138: remembered writeFile permission is reused for the whole restore', async ({ page }) => {
+    const zipPath = path.join(tmpDir, 'restore_permission_once.zip')
+    const archive = new JSZip()
+    archive.file('.workspaces/PermissionE2E/first.txt', 'FIRST')
+    archive.file('.workspaces/PermissionE2E/second.txt', 'SECOND')
+    fs.writeFileSync(zipPath, await archive.generateAsync({ type: 'nodebuffer' }))
+
+    try {
+      await page.goto('/')
+      await dismissWelcomeModal(page)
+      await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+
+      const writeFilePermissionAccepts = await restoreBackupZip(page, zipPath, 'imported second.txt', 1)
+      expect(writeFilePermissionAccepts, 'remembered writeFile permission is requested only once for both files').toBe(1)
+    } finally {
+      if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath)
+    }
+  })
+
   test('TC-WS-003: unicode / spaced file names survive backup without mojibake', async ({ page }) => {
     const unicodeName = '测试 合约 😀.sol'
     const marker = 'UNICODE_CONTENT_验证_42'

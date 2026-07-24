@@ -42,7 +42,7 @@ const profile = {
   location: 'sidePanel',
   documentation: 'https://developers.tron.network/docs/tron-ide',
   version: packageJson.version,
-  methods: ['getCompilationResult', 'compile', 'compileWithParameters', 'setCompilerConfig', 'compileFile']
+  methods: ['getCompilationResult', 'compile', 'compileWithParameters', 'setCompilerConfig', 'compileFile', 'getCompilerVersion']
 }
 
 // EditorApi:
@@ -187,8 +187,23 @@ class CompileTab extends ViewPlugin {
       this.data.loading = false
       this.setCompileErrors(data)
       if (success) {
-        // forwarding the event to the appManager infra
-        this.emit('compilationFinished', source.target, source, 'soljson', data)
+        // forwarding the event to the appManager infra. The 4th arg is the
+        // language version: pass the real solc version the binary reported
+        // (compiler.state.currentVersion, e.g. "0.8.20+commit.a1b79de6"),
+        // not the literal 'soljson' the upstream code hardcoded — downstream
+        // (compilerArtefacts.__last.languageversion, CV plugin, TronBox
+        // export) all read this field and were forced to recover the version
+        // from contract metadata instead (the stale-languageversion root cause).
+        //
+        // If the binary never reported a version, do NOT fall back to a fake
+        // 'soljson' string (that re-breaks the version-honesty fix by lying
+        // about the version). Emit an explicit 'unknown' instead — still a
+        // string so downstream `.indexOf` consumers don't crash, but honest.
+        const reportedVersion = this.compileTabLogic.compiler &&
+          this.compileTabLogic.compiler.state &&
+          this.compileTabLogic.compiler.state.currentVersion
+        const languageVersion = reportedVersion || 'unknown'
+        this.emit('compilationFinished', source.target, source, languageVersion, data)
         if (data.errors && data.errors.length > 0) {
           this.emit('statusChanged', {
             key: data.errors.length,
@@ -208,6 +223,12 @@ class CompileTab extends ViewPlugin {
       } else {
         const count = (data.errors ? data.errors.filter(error => error.severity === 'error').length : 0 + data.error ? 1 : 0)
         this.emit('statusChanged', { key: count, title: `compilation failed with ${count} error${count.length > 1 ? 's' : ''}`, type: 'error' })
+        // The bus 'compilationFinished' above is success-only, so consumers that
+        // need to know a compile FAILED (e.g. the AI panel's compile tool, which
+        // would otherwise wait out its timeout) get a dedicated event carrying
+        // the same error data. A separate name keeps success-only consumers
+        // (index builders, artifact stores) untouched.
+        this.emit('compilationFailed', data, source && source.target, source)
       }
       // Update contract Selection
       this.contractMap = {}
@@ -279,6 +300,16 @@ class CompileTab extends ViewPlugin {
       optimize: this.compileTabLogic.optimize,
       runs: this.compileTabLogic.runs
     }
+  }
+
+  // The version string of the compiler binary that is actually LOADED (e.g.
+  // "0.8.27+commit.19164bed.Emscripten.clang"), or '' before any loads. Lets
+  // callers (the AI panel's set-version tool) confirm a version finished loading
+  // rather than guess. Distinct from getCurrentCompilerConfig().currentVersion,
+  // which reflects the SELECTION, not what has actually loaded.
+  getCompilerVersion () {
+    const c = this.compileTabLogic && this.compileTabLogic.compiler
+    return (c && c.state && c.state.currentVersion) || ''
   }
 
   /**

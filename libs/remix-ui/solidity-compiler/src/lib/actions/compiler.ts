@@ -70,8 +70,11 @@ export const listenToEvents = (editor, compileTabLogic) => (dispatch: React.Disp
     dispatch(setCompilerMode('compilerLoaded'))
   })
 
-  compileTabLogic.compiler.event.register('compilerLoadFailed', (message) => {
-    dispatch(setCompilerMode('compilationFinished', false, { error: { formattedMessage: message, severity: 'error' } }, {}))
+  compileTabLogic.compiler.event.register('compilerLoadFailed', (message, url) => {
+    // distinct from 'compilationFinished' so the container can tell "the
+    // compiler binary failed to LOAD" (fallback-able) from "the user's code
+    // failed to compile" (not fallback-able)
+    dispatch(setCompilerMode('compilerLoadFailed', message, url))
   })
 
   compileTabLogic.compiler.event.register('compilationFinished', (success, data, source) => {

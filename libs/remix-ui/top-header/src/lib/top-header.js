@@ -19,6 +19,8 @@ import './top-header.css'
 import { BasicLogo } from './svgLogo'
 import { Tooltip, message } from 'antd'
 import JSZip from 'jszip'
+import * as githubAuth from '../../../../../apps/remix-ide/src/lib/github-auth'
+import { disconnectGithub } from '../../../../../apps/remix-ide/src/lib/github-connection'
 
 const LOCALHOST_WORKSPACE = ' - connect to localhost - '
 const NO_WORKSPACE = ' - none - '
@@ -76,6 +78,11 @@ const WALLET_CONNECT_TIMEOUT_MS = 60000
 // reload — never answers. So when an account is already cached, a short probe
 // tells a live wallet apart from a zombie one without forcing a reload.
 const WALLET_LIVENESS_TIMEOUT_MS = 8000
+// A live, authorized bridge answers silently. Recheck it at a deliberately low
+// frequency so an extension disabled after page load cannot leave a stale
+// connected label forever, without turning account authorization into a busy
+// poll. Focus-triggered refreshes use the same throttle.
+const WALLET_LIVENESS_RECHECK_INTERVAL_MS = 30000
 
 const requestTronAccountsWithTimeout = (tronLink, timeoutMs = WALLET_CONNECT_TIMEOUT_MS) => {
   return new Promise((resolve, reject) => {
@@ -121,6 +128,7 @@ export const TopHeader = ({ plugin, _deps }) => {
   const [githubState, setGithubState] = useState({ connected: false, login: '' })
   const [walletConnectInFlight, setWalletConnectInFlight] = useState(false)
   const [walletMenuOpen, setWalletMenuOpen] = useState(false)
+  const [githubMenuOpen, setGithubMenuOpen] = useState(false)
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const [workspaceBusy, setWorkspaceBusy] = useState(false)
   const [workspaces, setWorkspaces] = useState([])
@@ -130,18 +138,28 @@ export const TopHeader = ({ plugin, _deps }) => {
   const walletConnectInFlightRef = useRef(false)
   const walletStateRef = useRef(walletState)
   const walletRefreshIdRef = useRef(0)
-  const walletNetworkCacheRef = useRef({ key: '', label: '' })
+  const walletNetworkCacheRef = useRef({ provider: null, key: '', label: '' })
+  const walletNetworkCacheEpochRef = useRef(0)
   const walletManuallyDisconnectedRef = useRef(false)
+  // An explicit provider-side disconnect/revoke is authoritative even when
+  // TronLink leaves defaultAddress cached. Keep both injected identities so a
+  // genuine reconnect/account event or replacement of either object clears it.
+  const walletProviderDisconnectedRef = useRef(null)
   const walletWasConnectedRef = useRef(false)
   const walletListenerCleanupRef = useRef(null)
   // Liveness tracking for the injected bridge. walletProbedProviderRef holds the
-  // tronLink instance we last probed (one probe per instance); walletBridgeDeadRef
-  // is set when that probe proved the bridge is a stale zombie so the poll stops
-  // re-promoting "connected" from the cached account.
+  // tronLink instance most recently probed; walletBridgeDeadRef is set when a
+  // probe proves the bridge is a stale zombie so the poll cannot re-promote the
+  // cached account.
   const walletProbedProviderRef = useRef(null)
   const walletBridgeDeadRef = useRef(false)
+  const walletBridgeProbeAtRef = useRef(0)
+  const walletBridgeProbeInFlightRef = useRef(null)
+  const walletBridgeProbeIdRef = useRef(0)
+  const walletVmFallbackInFlightRef = useRef(null)
   const workspaceMenuRef = useRef(null)
   const walletMenuRef = useRef(null)
+  const githubMenuRef = useRef(null)
   const notificationsRef = useRef(null)
 
   useEffect(() => {
@@ -164,24 +182,20 @@ export const TopHeader = ({ plugin, _deps }) => {
 
   useEffect(() => {
     // Reflect the GitHub connection (made on the Home panel) in the header
-    // button — mirrors the wallet header. The home plugin persists the login to
-    // sessionStorage and dispatches 'tronideGithubConnectionChanged' on connect/
-    // disconnect; re-read on focus too so a reconnect elsewhere shows up.
-    const readGithub = () => {
-      let token = ''
-      let login = ''
-      try { token = window.sessionStorage.getItem('tronide.github.token') || '' } catch (e) { console.debug('[topHeader] sessionStorage read failed (github token)', e) }
-      try { login = window.sessionStorage.getItem('tronide.github.user') || '' } catch (e) { console.debug('[topHeader] sessionStorage read failed (github user)', e) }
-      return { connected: !!token, login }
-    }
+    // button — mirrors the wallet header. The token lives in this tab's session
+    // (lib/github-auth); read it from there and subscribe to its onChange.
+    // setToken/clearToken also dispatch 'tronideGithubConnectionChanged', so we
+    // keep that listener (plus focus) for any consumer that relies on the event.
+    // A refresh rehydrates the tab-session token; closing the tab forgets it.
+    const readGithub = () => ({ connected: !!githubAuth.getToken(), login: githubAuth.getLogin() })
     const refresh = () => setGithubState(readGithub())
     refresh()
+    githubAuth.onChange(refresh)
     window.addEventListener('tronideGithubConnectionChanged', refresh)
-    window.addEventListener('storage', refresh)
     window.addEventListener('focus', refresh)
     return () => {
+      githubAuth.offChange(refresh)
       window.removeEventListener('tronideGithubConnectionChanged', refresh)
-      window.removeEventListener('storage', refresh)
       window.removeEventListener('focus', refresh)
     }
   }, [])
@@ -201,10 +215,24 @@ export const TopHeader = ({ plugin, _deps }) => {
     const close = (event) => {
       if (workspaceMenuRef.current && !workspaceMenuRef.current.contains(event.target)) setWorkspaceMenuOpen(false)
       if (walletMenuRef.current && !walletMenuRef.current.contains(event.target)) setWalletMenuOpen(false)
+      if (githubMenuRef.current && !githubMenuRef.current.contains(event.target)) setGithubMenuOpen(false)
       if (notificationsRef.current && !notificationsRef.current.contains(event.target)) setNotificationsOpen(false)
     }
+    // Escape closes any open header menu (they are lightweight popovers, not
+    // modals — outside-click alone left keyboard users with no way out).
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return
+      setWorkspaceMenuOpen(false)
+      setWalletMenuOpen(false)
+      setGithubMenuOpen(false)
+      setNotificationsOpen(false)
+    }
     document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKeyDown)
+    }
   }, [])
 
   useEffect(() => {
@@ -237,6 +265,11 @@ export const TopHeader = ({ plugin, _deps }) => {
     plugin.call('tabs', 'focus', 'home')
   }
 
+  const onReleaseNotes = async () => {
+    await plugin.appManager.activatePlugin('releaseNotes')
+    plugin.call('tabs', 'focus', 'releaseNotes')
+  }
+
   const connectGithub = async () => {
     await onHome()
     window.setTimeout(() => {
@@ -247,19 +280,30 @@ export const TopHeader = ({ plugin, _deps }) => {
     window.setTimeout(() => {
       const target = document.querySelector('[data-id="landingGithubTokenPanel"]')
       if (target && target.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      const connectButton = document.querySelector('[data-id="landingGithubTokenConnect"]')
+      const connectButton = document.querySelector('[data-id="landingGithubOAuthConnect"]')
       if (connectButton && typeof connectButton.click === 'function') connectButton.click()
     }, 180)
+  }
+
+  // When already connected, the header GitHub button opens this menu instead of
+  // re-running the OAuth popup (which GitHub, seeing the app already authorized,
+  // would flash open and immediately close). Reconnect re-runs OAuth on demand;
+  // Disconnect goes through the shared full-cleanup so it matches Home exactly.
+  const reconnectGithub = () => {
+    setGithubMenuOpen(false)
+    connectGithub()
+  }
+  const onGithubDisconnect = () => {
+    disconnectGithub()
+    setGithubMenuOpen(false)
+    // githubAuth.clearToken() (inside disconnectGithub) notifies our own
+    // subscriber, but set state here too so the label flips without waiting.
+    setGithubState({ connected: false, login: '' })
   }
 
   const showAiPopup = async () => {
     plugin.call('aiPanel', 'hide')
     gtag('event', 'click', { event_category: 'ai_user_action', event_label: 'show_ai' })
-  }
-
-  const settingsHandler = () => {
-    plugin.call('menuicons', 'toggle', 'settings')
-    gtag('event', 'click', { event_category: 'settings_user_action', event_label: 'settings' })
   }
 
   const toggleSidePanel = () => {
@@ -368,17 +412,33 @@ export const TopHeader = ({ plugin, _deps }) => {
     return currentWorkspace || 'default_workspace'
   }
 
-  const refreshNotifications = () => {
+  const readNotifications = () => {
     try {
       const items = JSON.parse(window.localStorage.getItem('tronide.home.notifications') || '[]')
-      setNotifications(Array.isArray(items) ? items.slice(0, 8) : [])
+      return Array.isArray(items) ? items.slice(0, 8) : []
     } catch (error) {
-      setNotifications([])
+      return []
     }
   }
 
+  const refreshNotifications = () => setNotifications(readNotifications())
+
   const toggleNotifications = () => {
-    refreshNotifications()
+    if (!notificationsOpen) {
+      const items = readNotifications()
+      const updated = items.map((item) => item && item.read === true ? item : Object.assign({}, item, { read: true }))
+      try {
+        if (updated.some((item, index) => item !== items[index])) {
+          window.localStorage.setItem('tronide.home.notifications', JSON.stringify(updated))
+          window.dispatchEvent(new CustomEvent('tronideHomeNotificationsChanged'))
+        }
+      } catch (error) {
+        console.debug('[topHeader] failed to mark notifications as read', error)
+      }
+      setNotifications(updated)
+    } else {
+      refreshNotifications()
+    }
     setNotificationsOpen(!notificationsOpen)
   }
 
@@ -387,6 +447,8 @@ export const TopHeader = ({ plugin, _deps }) => {
     setNotifications([])
     window.dispatchEvent(new CustomEvent('tronideHomeNotificationsChanged'))
   }
+
+  const unreadNotificationCount = notifications.filter((item) => !item || item.read !== true).length
 
   const shortenTronAddress = (address) => {
     if (!address || address.length <= 14) return address || ''
@@ -398,9 +460,16 @@ export const TopHeader = ({ plugin, _deps }) => {
     tronWeb: window.tronWeb || null
   })
 
+  const isSameInjectedWallet = (left, right) => !!left && !!right && left.tronLink === right.tronLink && left.tronWeb === right.tronWeb
+
   const getInjectedWalletAccount = () => {
     const injected = getInjectedWallet()
     return injected.tronWeb && injected.tronWeb.defaultAddress && injected.tronWeb.defaultAddress.base58
+  }
+
+  const clearWalletNetworkCache = () => {
+    walletNetworkCacheEpochRef.current += 1
+    walletNetworkCacheRef.current = { provider: null, key: '', label: '' }
   }
 
   const getInjectedWalletNetworkHostLabel = () => {
@@ -429,44 +498,117 @@ export const TopHeader = ({ plugin, _deps }) => {
 
   const getInjectedWalletNetwork = async () => {
     const injected = getInjectedWallet()
+    const provider = injected.tronWeb
     const key = getInjectedWalletNetworkKey()
-    if (walletNetworkCacheRef.current.key === key && walletNetworkCacheRef.current.label) {
+    if (walletNetworkCacheRef.current.provider === provider && walletNetworkCacheRef.current.key === key && walletNetworkCacheRef.current.label) {
       return walletNetworkCacheRef.current.label
     }
+    const cacheEpoch = walletNetworkCacheEpochRef.current
+    const cacheIfCurrent = (label) => {
+      const current = getInjectedWallet()
+      if (walletNetworkCacheEpochRef.current === cacheEpoch && current.tronWeb === provider && getInjectedWalletNetworkKey() === key) {
+        walletNetworkCacheRef.current = { provider, key, label }
+      }
+      return label
+    }
     try {
-      const genesisLabel = await getNetworkFromGenesisBlock(injected.tronWeb)
+      const genesisLabel = await getNetworkFromGenesisBlock(provider)
       if (genesisLabel) {
-        walletNetworkCacheRef.current = { key, label: genesisLabel }
-        return genesisLabel
+        return cacheIfCurrent(genesisLabel)
       }
     } catch (error) {
       console.debug('[topHeader] genesis network detection failed; falling back to host label', error)
     }
     const fallbackLabel = getInjectedWalletNetworkHostLabel()
-    walletNetworkCacheRef.current = { key, label: fallbackLabel }
-    return fallbackLabel
+    return cacheIfCurrent(fallbackLabel)
   }
 
-  // Probe whether an injected provider's bridge is actually live, once per
-  // provider instance. Runs in the background so the optimistic "connected"
-  // display isn't blocked; if the probe fails (dead/stale extension) we demote
-  // the header and remember the provider is dead so the poll won't re-promote.
-  const maybeVerifyWalletBridge = (tronLink) => {
-    if (!tronLink || typeof tronLink.request !== 'function') return
-    if (walletProbedProviderRef.current === tronLink) return
+  const invalidateWalletBridgeProbe = () => {
+    walletBridgeProbeIdRef.current += 1
+    walletBridgeProbeInFlightRef.current = null
+    walletBridgeProbeAtRef.current = 0
+  }
+
+  const noteWalletProviderAlive = (tronLink = getInjectedWallet().tronLink) => {
+    invalidateWalletBridgeProbe()
+    walletProviderDisconnectedRef.current = null
     walletProbedProviderRef.current = tronLink
     walletBridgeDeadRef.current = false
+    walletBridgeProbeAtRef.current = Date.now()
+  }
+
+  const switchDeployAndRunToVmAfterWalletDisconnect = () => {
+    const disconnectEpoch = walletBridgeProbeIdRef.current
+    if (walletVmFallbackInFlightRef.current === disconnectEpoch) return
+    walletVmFallbackInFlightRef.current = disconnectEpoch
+    Promise.resolve()
+      .then(async () => {
+        if (walletBridgeProbeIdRef.current !== disconnectEpoch) return
+        if (!plugin.appManager || !await plugin.appManager.isActive('udapp')) return
+        // A connect/account event invalidates the disconnect epoch. Do not let
+        // an older asynchronous fallback override a freshly reconnected user.
+        if (walletBridgeProbeIdRef.current !== disconnectEpoch) return
+        await plugin.call('udapp', 'disconnectInjectedTronWeb')
+      })
+      .catch((error) => {
+        console.debug('[topHeader] failed to switch Deploy & Run after external wallet disconnect', error)
+      })
+      .finally(() => {
+        if (walletVmFallbackInFlightRef.current === disconnectEpoch) walletVmFallbackInFlightRef.current = null
+      })
+  }
+
+  // Probe whether an injected provider's bridge is actually live. Runs in the
+  // background so the optimistic "connected" display isn't blocked. The probe
+  // is repeated at a low frequency for the same object because disabling an
+  // extension does not replace its already-injected window objects.
+  const maybeVerifyWalletBridge = (tronLink) => {
+    if (!tronLink || typeof tronLink.request !== 'function') return
+    const now = Date.now()
+    const sameProvider = walletProbedProviderRef.current === tronLink
+    const inFlight = walletBridgeProbeInFlightRef.current
+    if (sameProvider && inFlight && inFlight.provider === tronLink) return
+    if (sameProvider && now - walletBridgeProbeAtRef.current < WALLET_LIVENESS_RECHECK_INTERVAL_MS) return
+    const probeId = ++walletBridgeProbeIdRef.current
+    walletProbedProviderRef.current = tronLink
+    walletBridgeProbeAtRef.current = now
+    walletBridgeProbeInFlightRef.current = { provider: tronLink, probeId }
+    walletBridgeDeadRef.current = false
     requestTronAccountsWithTimeout(tronLink, WALLET_LIVENESS_TIMEOUT_MS)
-      .then(() => { /* bridge answered → genuinely connected, leave state as-is */ })
-      .catch(() => {
+      .then((result) => {
+        if (walletBridgeProbeIdRef.current !== probeId) return
+        const responseCode = result && (result.code != null ? result.code : (result.data && result.data.code))
+        // These responses prove the bridge is alive, but also prove that it no
+        // longer exposes an account. Treat them as a clean provider disconnect,
+        // not as a dead-extension/reload error.
+        const emptyLegacyResponse = result === '' || (result && result.code == null && result.message === '')
+        if (/^(4001|4100|4900)$/.test(String(responseCode || '')) || emptyLegacyResponse || (Array.isArray(result) && !result.length)) {
+          onWalletDisconnected()
+        }
+      })
+      .catch((error) => {
         // Only act if this is still the current provider and nothing newer ran.
-        if (walletProbedProviderRef.current !== tronLink) return
+        if (walletBridgeProbeIdRef.current !== probeId || walletProbedProviderRef.current !== tronLink) return
         if (getInjectedWallet().tronLink !== tronLink) return
         if (walletManuallyDisconnectedRef.current) return
+        const errorMessage = String((error && (error.message || error)) || '')
+        const errorCode = String((error && error.code) || '')
+        if (/^(4001|4100|4900)$/.test(errorCode) || /reject|unlock|locked|unauthorized|disconnect|not connected/i.test(errorMessage)) {
+          onWalletDisconnected()
+          return
+        }
+        walletRefreshIdRef.current += 1
         walletBridgeDeadRef.current = true
-        walletNetworkCacheRef.current = { key: '', label: '' }
+        walletWasConnectedRef.current = false
+        clearWalletNetworkCache()
+        setWalletMenuOpen(false)
         setWalletState({ status: 'error', account: '', network: '', message: WALLET_ERROR_MESSAGES.WALLET_NO_ACCOUNT })
+        switchDeployAndRunToVmAfterWalletDisconnect()
         message.error(WALLET_ERROR_MESSAGES.WALLET_NO_ACCOUNT)
+      })
+      .finally(() => {
+        const current = walletBridgeProbeInFlightRef.current
+        if (current && current.probeId === probeId) walletBridgeProbeInFlightRef.current = null
       })
   }
 
@@ -474,12 +616,16 @@ export const TopHeader = ({ plugin, _deps }) => {
     const refreshId = ++walletRefreshIdRef.current
     const injected = getInjectedWallet()
     if (!injected.tronLink || !injected.tronWeb) {
-      walletNetworkCacheRef.current = { key: '', label: '' }
+      clearWalletNetworkCache()
       if (refreshId === walletRefreshIdRef.current) {
         setWalletState({ status: 'error', account: '', network: '', message: 'TronLink is not installed' })
       }
       return
     }
+    if (walletProviderDisconnectedRef.current && !isSameInjectedWallet(walletProviderDisconnectedRef.current, injected)) {
+      walletProviderDisconnectedRef.current = null
+    }
+    if (isSameInjectedWallet(walletProviderDisconnectedRef.current, injected)) return
     // A provider we already proved dead must not be re-promoted from its cached
     // account by the recurring poll. Stay put until the page reloads or TronLink
     // re-injects a fresh object (handled by maybeVerifyWalletBridge's identity
@@ -495,7 +641,7 @@ export const TopHeader = ({ plugin, _deps }) => {
       account = getInjectedWalletAccount()
     }
     if (!account) {
-      walletNetworkCacheRef.current = { key: '', label: '' }
+      clearWalletNetworkCache()
       if (refreshId === walletRefreshIdRef.current) {
         const disconnectedMessage = reason === 'disconnect' ? WALLET_ERROR_MESSAGES.WALLET_DISCONNECTED : 'Please unlock TronLink and try again'
         setWalletState({ status: reason === 'disconnect' ? 'disconnected' : 'error', account: '', network: '', message: disconnectedMessage })
@@ -526,6 +672,26 @@ export const TopHeader = ({ plugin, _deps }) => {
     })
   }
 
+  const onWalletDisconnected = () => {
+    if (walletManuallyDisconnectedRef.current) return
+    walletRefreshIdRef.current += 1
+    walletProviderDisconnectedRef.current = getInjectedWallet()
+    walletWasConnectedRef.current = false
+    walletBridgeDeadRef.current = false
+    invalidateWalletBridgeProbe()
+    walletProbedProviderRef.current = null
+    clearWalletNetworkCache()
+    setWalletMenuOpen(false)
+    setWalletState({ status: 'disconnected', account: '', network: '', message: WALLET_ERROR_MESSAGES.WALLET_DISCONNECTED })
+    switchDeployAndRunToVmAfterWalletDisconnect()
+  }
+
+  const onWalletConnected = () => {
+    if (walletManuallyDisconnectedRef.current) return
+    noteWalletProviderAlive()
+    window.setTimeout(() => scheduleWalletStateRefresh('connect'), 100)
+  }
+
   const onWalletAccountsChanged = (accounts) => {
     if (walletManuallyDisconnectedRef.current) return
     const nextAccount = Array.isArray(accounts)
@@ -536,25 +702,48 @@ export const TopHeader = ({ plugin, _deps }) => {
       return
     }
     if (!nextAccount) {
-      setWalletState({ status: 'disconnected', account: '', network: '', message: WALLET_ERROR_MESSAGES.WALLET_DISCONNECTED })
+      onWalletDisconnected()
       return
     }
-    setWalletState((current) => current.status === 'connected' ? Object.assign({}, current, { account: nextAccount, message: 'Account updated' }) : current)
-    window.setTimeout(() => scheduleWalletStateRefresh('account'), 100)
+    const wasConnected = walletStateRef.current.status === 'connected'
+    noteWalletProviderAlive()
+    walletWasConnectedRef.current = true
+    if (wasConnected) {
+      setWalletState((current) => Object.assign({}, current, { account: nextAccount, message: 'Account updated' }))
+    }
+    window.setTimeout(() => scheduleWalletStateRefresh(wasConnected ? 'account' : 'connect'), 100)
   }
 
   const onWalletNetworkChanged = () => {
     if (walletManuallyDisconnectedRef.current) return
-    walletNetworkCacheRef.current = { key: '', label: '' }
+    clearWalletNetworkCache()
     window.setTimeout(() => scheduleWalletStateRefresh('network'), 100)
   }
 
   const onWalletMessage = (event) => {
-    const data = event && event.data ? event.data : event
+    // TronLink's injected page bridge posts through this same window. Reject
+    // messages delivered by an opener/iframe from another origin (or another
+    // Window object) before interpreting any wallet action. Without both checks
+    // an attacker page that opened TronIDE could forge connect/disconnect and
+    // account-change UI events.
+    if (!event || event.source !== window || event.origin !== window.location.origin) return
+    const envelope = event && event.data ? event.data : event
+    // TronLink's window-message API wraps updates as
+    // { message: { action, data } }; emitter-style providers usually put the
+    // action at the top level. Accept both so the header reflects the event
+    // immediately instead of depending on the recurring poll.
+    const data = envelope && envelope.message && typeof envelope.message === 'object' ? envelope.message : envelope
     const action = data && (data.action || data.type || data.method)
     if (!action) return
-    if (/accounts?Changed|setAccount|accountChanged|addressChanged/i.test(action)) onWalletAccountsChanged(data.accounts || data.account || data.address)
-    if (/chainChanged|networkChanged|setNode|nodeChanged|connect|disconnect/i.test(action)) onWalletNetworkChanged()
+    const detail = data.data
+    const detailAccount = detail && typeof detail === 'object'
+      ? (detail.accounts !== undefined ? detail.accounts : (detail.account !== undefined ? detail.account : (detail.address !== undefined ? detail.address : detail.base58)))
+      : detail
+    const accounts = data.accounts !== undefined ? data.accounts : (data.account !== undefined ? data.account : (data.address !== undefined ? data.address : (data.base58 !== undefined ? data.base58 : detailAccount)))
+    if (/accounts?Changed|setAccount|accountChanged|addressChanged/i.test(action)) onWalletAccountsChanged(accounts)
+    if (/^(disconnect|disconnectWeb|rejectWeb)$/i.test(action)) onWalletDisconnected()
+    else if (/chainChanged|networkChanged|setNode|nodeChanged/i.test(action)) onWalletNetworkChanged()
+    else if (/^(connect|connectWeb|acceptWeb)$/i.test(action)) onWalletConnected()
   }
 
   const attachWalletEmitterListener = (emitter, eventName, handler, removers) => {
@@ -587,9 +776,11 @@ export const TopHeader = ({ plugin, _deps }) => {
       ;['accountsChanged', 'accountChanged', 'setAccount', 'addressChanged'].forEach((eventName) => {
         attachWalletEmitterListener(emitter, eventName, onWalletAccountsChanged, removers)
       })
-      ;['chainChanged', 'networkChanged', 'setNode', 'nodeChanged', 'connect', 'disconnect'].forEach((eventName) => {
+      ;['chainChanged', 'networkChanged', 'setNode', 'nodeChanged'].forEach((eventName) => {
         attachWalletEmitterListener(emitter, eventName, onWalletNetworkChanged, removers)
       })
+      attachWalletEmitterListener(emitter, 'connect', onWalletConnected, removers)
+      attachWalletEmitterListener(emitter, 'disconnect', onWalletDisconnected, removers)
     })
 
     walletListenerCleanupRef.current = () => {
@@ -602,9 +793,11 @@ export const TopHeader = ({ plugin, _deps }) => {
 
   const disconnectWallet = async () => {
     walletManuallyDisconnectedRef.current = true
+    walletProviderDisconnectedRef.current = getInjectedWallet()
+    invalidateWalletBridgeProbe()
     setWalletManuallyDisconnected(true)
     walletWasConnectedRef.current = false
-    walletNetworkCacheRef.current = { key: '', label: '' }
+    clearWalletNetworkCache()
     setWalletMenuOpen(false)
     setWalletState({ status: 'disconnected', account: '', network: '', message: 'Connect Wallet' })
     try {
@@ -626,7 +819,7 @@ export const TopHeader = ({ plugin, _deps }) => {
 
   const renderWalletLabel = () => {
     if (walletConnectInFlight) return 'Connecting Wallet…'
-    if (walletState.status === 'connected') return `Wallet ${shortenTronAddress(walletState.account)} · ${walletState.network}`
+    if (walletState.status === 'connected') return `${shortenTronAddress(walletState.account)} · ${walletState.network}`
     // On error keep the button compact ("Connect Wallet") — the failure reason is
     // surfaced via the toast (message.error) on click, not crammed into the label.
     return 'Connect Wallet'
@@ -635,6 +828,7 @@ export const TopHeader = ({ plugin, _deps }) => {
   const connectWallet = async () => {
     if (walletConnectInFlightRef.current) return
     walletManuallyDisconnectedRef.current = false
+    invalidateWalletBridgeProbe()
     setWalletManuallyDisconnected(false)
     setWalletMenuOpen(false)
     bindWalletProviderListeners()
@@ -717,8 +911,7 @@ export const TopHeader = ({ plugin, _deps }) => {
       walletWasConnectedRef.current = true
       // This connect completed a real round-trip, so the bridge is proven live —
       // clear any dead mark and treat this instance as already probed.
-      walletProbedProviderRef.current = injected.tronLink
-      walletBridgeDeadRef.current = false
+      noteWalletProviderAlive(injected.tronLink)
       setWalletState({ status: 'connected', account, network, message: 'Connected' })
     } catch (error) {
       const walletMessage = normalizeTronLinkErrorMessage(error)
@@ -755,6 +948,8 @@ export const TopHeader = ({ plugin, _deps }) => {
     window.addEventListener('focus', onFocusRefresh)
     const intervalId = window.setInterval(() => {
       if (walletManuallyDisconnectedRef.current) return
+      const injected = getInjectedWallet()
+      if (isSameInjectedWallet(walletProviderDisconnectedRef.current, injected)) return
       const recoverable = walletWasConnectedRef.current || walletStateRef.current.status === 'connected'
       // Promote the header when the provider already holds an account it hasn't
       // reflected yet (connection made outside the header). reason 'connect'
@@ -779,9 +974,15 @@ export const TopHeader = ({ plugin, _deps }) => {
         <div className='homeIcon' onClick={onHome}>
           <BasicLogo />
         </div>
-        <div className='header-version'>
+        <button
+          type='button'
+          className='header-version'
+          data-id='headerVersionBadge'
+          title='View release notes'
+          onClick={onReleaseNotes}
+        >
           v{version}
-        </div>
+        </button>
       </div>
       <div className='header-workspace-menu' ref={workspaceMenuRef} data-id='headerWorkspaceMenu'>
         <button
@@ -823,28 +1024,62 @@ export const TopHeader = ({ plugin, _deps }) => {
         }
       </div>
       <div className='header-right-cluster d-flex align-items-center'>
-      <div className='header-layout-toggles' data-id='headerLayoutToggles'>
-        <Tooltip title='Toggle Side Panel'>
-          <button className='layout-toggle-btn' data-id='headerToggleSidePanel' onClick={toggleSidePanel} aria-label='Toggle Side Panel'>
-            <span className='layout-toggle-icon layout-toggle-icon-left' aria-hidden='true'></span>
-          </button>
-        </Tooltip>
-        <Tooltip title='Toggle Bottom Panel'>
-          <button className='layout-toggle-btn' data-id='headerToggleBottomPanel' onClick={toggleBottomPanel} aria-label='Toggle Bottom Panel'>
-            <span className='layout-toggle-icon layout-toggle-icon-bottom' aria-hidden='true'></span>
-          </button>
-        </Tooltip>
-        <Tooltip title='Toggle AI Panel'>
-          <button className='layout-toggle-btn' data-id='headerToggleAiPanel' onClick={toggleAiPanel} aria-label='Toggle AI Panel'>
-            <span className='layout-toggle-icon layout-toggle-icon-right' aria-hidden='true'></span>
-          </button>
-        </Tooltip>
-      </div>
+        <div className='header-layout-toggles' data-id='headerLayoutToggles'>
+          <Tooltip title='Toggle Side Panel'>
+            <button className='layout-toggle-btn' data-id='headerToggleSidePanel' onClick={toggleSidePanel} aria-label='Toggle Side Panel'>
+              <span className='layout-toggle-icon layout-toggle-icon-left' aria-hidden='true'></span>
+            </button>
+          </Tooltip>
+          <Tooltip title='Toggle Bottom Panel'>
+            <button className='layout-toggle-btn' data-id='headerToggleBottomPanel' onClick={toggleBottomPanel} aria-label='Toggle Bottom Panel'>
+              <span className='layout-toggle-icon layout-toggle-icon-bottom' aria-hidden='true'></span>
+            </button>
+          </Tooltip>
+          <Tooltip title='Toggle AI Panel'>
+            <button className='layout-toggle-btn' data-id='headerToggleAiPanel' onClick={toggleAiPanel} aria-label='Toggle AI Panel'>
+              <span className='layout-toggle-icon layout-toggle-icon-right' aria-hidden='true'></span>
+            </button>
+          </Tooltip>
+        </div>
+        <div className='header-help-actions d-flex align-items-center' data-id='headerHelpActions'>
+          <Tooltip title='Release Notes'>
+            <button className='settings-icon-wrapper' data-id='headerReleaseNotes' aria-label='Release Notes' onClick={onReleaseNotes}>
+              <i className='fas fa-bullhorn' aria-hidden='true'></i>
+            </button>
+          </Tooltip>
+          <Tooltip title='Report an issue / Feedback'>
+            <button className='settings-icon-wrapper' data-id='headerReportIssue' aria-label='Report an issue on GitHub' onClick={() => { try { window.open('https://github.com/tronweb3/TronIDE/issues', '_blank', 'noopener,noreferrer') } catch (e) { console.debug('[topHeader] open issues failed', e) } }}>
+              <i className='fas fa-comment-dots' aria-hidden='true'></i>
+            </button>
+          </Tooltip>
+        </div>
         <div className='header-actions'>
-          <button className='header-action-btn' data-id='headerGithubConnect' onClick={connectGithub} title={githubState.connected ? `GitHub: ${githubState.login || 'connected'}` : 'Connect GitHub'}>
-            <i className='fab fa-github header-action-icon'></i>
-            <span>{githubState.connected ? (githubState.login || 'GitHub') : 'Connect GitHub'}</span>
-          </button>
+          <div className='header-github-action' ref={githubMenuRef}>
+            <button
+              className='header-action-btn'
+              data-id='headerGithubConnect'
+              title={githubState.connected ? `GitHub: ${githubState.login || 'connected'}` : 'Connect GitHub'}
+              aria-haspopup={githubState.connected ? 'menu' : undefined}
+              aria-expanded={githubState.connected ? githubMenuOpen : undefined}
+              onClick={githubState.connected ? () => setGithubMenuOpen(!githubMenuOpen) : connectGithub}
+            >
+              <i className='fab fa-github header-action-icon'></i>
+              <span>{githubState.connected ? (githubState.login || 'GitHub') : 'Connect GitHub'}</span>
+            </button>
+            {githubMenuOpen && githubState.connected &&
+              <div className='header-github-menu' data-id='headerGithubMenu' role='menu'>
+                <div className='github-menu-title'>GitHub</div>
+                <div className='github-menu-row'>
+                  <span>Account</span>
+                  <strong data-id='headerGithubAccount' title={githubState.login}>{githubState.login || 'Connected'}</strong>
+                </div>
+                <div className='github-menu-actions'>
+                  <button type='button' data-id='headerGithubReconnect' onClick={reconnectGithub}>Reconnect</button>
+                  <button type='button' data-id='headerGithubDisconnect' onClick={onGithubDisconnect}>Disconnect</button>
+                </div>
+              </div>
+            }
+          </div>
           <div className='header-wallet-action' ref={walletMenuRef}>
             <button
               className='header-action-btn wallet-action-btn'
@@ -899,7 +1134,7 @@ export const TopHeader = ({ plugin, _deps }) => {
             title='Notifications'
           >
             <i className='fas fa-bell' aria-hidden='true'></i>
-            {notifications.length ? <span className='notification-badge'>{notifications.length}</span> : null}
+            {unreadNotificationCount ? <span className='notification-badge'>{unreadNotificationCount}</span> : null}
           </button>
           {notificationsOpen &&
             <div className='header-notifications-dropdown' data-id='headerNotificationsPanel'>
@@ -914,16 +1149,6 @@ export const TopHeader = ({ plugin, _deps }) => {
             </div>
           }
         </div>
-        <button
-          type='button'
-          className='settings-icon-wrapper'
-          onClick={settingsHandler}
-          data-id='headerSettingsButton'
-          aria-label='Open settings'
-          title='Open settings'
-        >
-          <i className='fas fa-cog' aria-hidden='true'></i>
-        </button>
       </div>
     </div>
   )

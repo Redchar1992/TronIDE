@@ -25,9 +25,11 @@ const yo = require('yo-yo')
 const ethJSUtil = require('@tvmjs/util')
 const { BN } = require('ethereumjs-util')
 const Web3 = require('web3')
-const { execution } = require('@remix-project/remix-lib')
+const { execution, util } = require('@remix-project/remix-lib')
 const EventManager = require('../../lib/events')
+const helper = require('../../lib/helper')
 const Card = require('../ui/card')
+const copyToClipboard = require('../ui/copy-to-clipboard')
 
 const css = require('../tabs/styles/run-tab-styles')
 const SettingsUI = require('../tabs/runTab/settings.js')
@@ -53,7 +55,7 @@ const profile = {
   version: packageJson.version,
   permission: true,
   events: ['newTransaction'],
-  methods: ['connectInjectedTronWeb', 'disconnectInjectedTronWeb', 'createVMAccount', 'sendTransaction', 'getAccounts', 'pendingTransactionsCount', 'getSettings', 'setEnvironmentMode']
+  methods: ['connectInjectedTronWeb', 'disconnectInjectedTronWeb', 'createVMAccount', 'sendTransaction', 'getAccounts', 'pendingTransactionsCount', 'getSettings', 'setEnvironmentMode', 'aiListContracts', 'aiDeploy', 'aiCallMethod', 'aiListAccounts', 'aiGetBalance', 'aiExportTronbox', 'aiSaveScenario', 'aiRunScenario', 'aiRecordingInfo']
 }
 
 export class RunTab extends ViewPlugin {
@@ -72,6 +74,396 @@ export class RunTab extends ViewPlugin {
     this._externalEventSubscriptions = []
     this._managerEventSubscriptionsRegistered = false
     this.setupEvents()
+  }
+
+  // --- Programmatic deploy/interact for the AI assistant ---------------------
+  // These expose the SAME blockchain pipeline the Deploy & Run UI drives
+  // (compile artifact -> constructor/tx encoding -> sign -> receipt), so an AI
+  // action deploys/calls exactly as a manual click would: on Injected the
+  // wallet still prompts for every signature; on the JavaScript VM it runs
+  // free. The AI panel gates every deploy and every state-changing call behind
+  // an explicit user confirmation before it calls these.
+
+  _aiDropdownLogic () {
+    if (!this._aiDL) this._aiDL = new DropdownLogic(this.compilersArtefacts, this.config, this.editor, this)
+    return this._aiDL
+  }
+
+  // The tx encoder (txFormat.encodeParams) expects the UI's STRING form:
+  // it does `JSON.parse('[' + params + ']')`, so a raw args array throws
+  // ("str.charAt is not a function"). Turn [7, "T..."] into `7, "T..."` —
+  // JSON.stringify per element gives numbers/bools bare and strings quoted,
+  // matching what the input fields produce. A string is passed through as-is.
+  _aiEncodeArgs (args) {
+    if (typeof args === 'string') return args
+    if (!Array.isArray(args) || args.length === 0) return ''
+    return args.map((a) => {
+      try { return JSON.stringify(a) } catch (e) { return String(a) }
+    }).join(', ')
+  }
+
+  // Normalize the optional money fields of an AI deploy/call. Amounts are
+  // integer strings — `value` in SUN (1 TRX = 1,000,000 SUN), `tokenValue` in
+  // the TRC10 token's raw units. Returns undefined when nothing is set, so
+  // downstream keeps reading the Deploy & Run panel fields as before.
+  _aiTxMeta ({ value, tokenId, tokenValue } = {}) {
+    // The runner input contract differs per field: `value` (SUN) is parsed
+    // radix-10, but tokenId/tokenValue are parsed radix-16 on the injected
+    // runner (txRunnerWeb3.runInTron) — matching the panel's getExtendValue,
+    // which emits "0x"+hex. A bare decimal there is silently reinterpreted as
+    // hex on a real wallet (e.g. "20" -> 0x20 = 32). So keep value decimal and
+    // emit the TRC10 fields as 0x-hex.
+    const norm = (v, label, radix) => {
+      if (v === undefined || v === null || v === '') return undefined
+      let n
+      try { n = BigInt(v) } catch (e) { throw new Error(`${label} must be a plain integer (got "${v}").`) }
+      if (n < BigInt(0)) throw new Error(`${label} cannot be negative.`)
+      if (n === BigInt(0)) return undefined
+      return radix === 16 ? '0x' + n.toString(16) : n.toString()
+    }
+    const normValue = norm(value, 'value (in SUN)', 10)
+    const normTokenId = norm(tokenId, 'token_id', 16)
+    const normTokenValue = norm(tokenValue, 'token_value', 16)
+    if (normTokenValue && !normTokenId) throw new Error('token_value needs token_id (the TRC10 token to send).')
+    if (normTokenId && !normTokenValue) throw new Error('token_id needs token_value (how much of the token to send).')
+    if (!normValue && !normTokenId) return undefined
+    const meta = {}
+    if (normValue) meta.value = normValue
+    if (normTokenId) { meta.tokenId = normTokenId; meta.tokenValue = normTokenValue }
+    return meta
+  }
+
+  // Validate an AI-supplied sender against the environment's accounts and
+  // return the canonical form to send FROM. undefined => use the account
+  // selected in the Deploy & Run panel (the existing default).
+  async _aiResolveFrom (from) {
+    if (from === undefined || from === null || String(from).trim() === '') return undefined
+    const wanted = String(from).trim()
+    let accounts = []
+    try { accounts = await this.blockchain.getAccounts() || [] } catch (e) { accounts = [] }
+    const match = (accounts || []).find((a) => String(a).toLowerCase() === wanted.toLowerCase())
+    if (!match) throw new Error(`"${wanted}" is not one of the available accounts — use list_accounts to see them.`)
+    return match
+  }
+
+  // List the environment's accounts with balances (TRX). VM gives the
+  // deterministic set; injected gives the connected wallet's address(es).
+  async aiListAccounts () {
+    let accounts = []
+    try { accounts = await this.blockchain.getAccounts() || [] } catch (e) { accounts = [] }
+    if (!accounts.length) return { ok: false, message: 'No accounts available — on Injected, connect your wallet first.' }
+    const out = []
+    for (const address of accounts) {
+      const balance = await new Promise((resolve) => {
+        try { this.blockchain.getBalanceInEther(address, (err, b) => resolve(err ? null : b)) } catch (e) { resolve(null) }
+      })
+      out.push({ address, balanceTrx: balance })
+    }
+    return { ok: true, environment: this.blockchain.getProvider(), accounts: out }
+  }
+
+  // Balance (in TRX) of a single address in the current environment.
+  async aiGetBalance ({ address } = {}) {
+    if (!address) throw new Error('Provide an address to check the balance of.')
+    const balance = await new Promise((resolve, reject) => {
+      try { this.blockchain.getBalanceInEther(String(address).trim(), (err, b) => err ? reject(err) : resolve(b)) } catch (e) { reject(e) }
+    })
+    return { ok: true, address: String(address).trim(), balanceTrx: balance }
+  }
+
+  _aiSelectedContract (contractName) {
+    const dl = this._aiDropdownLogic()
+    if (!this.compilersArtefacts || !this.compilersArtefacts.__last) {
+      throw new Error('Nothing compiled yet — compile a contract first.')
+    }
+    const selected = dl.getSelectedContract(contractName, '__last')
+    if (!selected) throw new Error(`No compiled contract named "${contractName}". Compile it, then check the exact contract name.`)
+    return selected
+  }
+
+  // Export the recorded deploy/interaction flow as a TronBox project. The
+  // recorder UI is a sub-component of this tab (not an engine-registered plugin),
+  // so the AI tool routes through udapp (which IS registered) and delegates.
+  async aiExportTronbox (opts = {}) {
+    if (!this.recorderInterface || !this.recorderInterface.aiExportTronbox) return { ok: false, message: 'The recorder is not available.' }
+    return this.recorderInterface.aiExportTronbox(opts)
+  }
+
+  // Save the current recording to a workspace scenario.json (delegates to the
+  // recorder sub-component; see aiExportTronbox for why this routes through udapp).
+  async aiSaveScenario (opts = {}) {
+    if (!this.recorderInterface || !this.recorderInterface.aiSaveScenario) return { ok: false, message: 'The recorder is not available.' }
+    return this.recorderInterface.aiSaveScenario(opts)
+  }
+
+  // Replay a scenario.json — re-execute its recorded transactions.
+  async aiRunScenario (opts = {}) {
+    if (!this.recorderInterface || !this.recorderInterface.aiRunScenario) return { ok: false, message: 'The recorder is not available.' }
+    return this.recorderInterface.aiRunScenario(opts)
+  }
+
+  // Live recording journal info (tx count) — read-only; lets the chat warn
+  // before a replay clears the journal and put real counts in write confirms.
+  async aiRecordingInfo () {
+    if (!this.recorderInterface || !this.recorderInterface.aiRecordingInfo) return { ok: false, message: 'The recorder is not available.' }
+    return this.recorderInterface.aiRecordingInfo()
+  }
+
+  // List the contracts available to deploy from the last compilation.
+  async aiListContracts () {
+    if (!this.compilersArtefacts || !this.compilersArtefacts.__last) return { ok: false, message: 'Nothing compiled yet — compile a contract first.' }
+    const contracts = []
+    try {
+      this.compilersArtefacts.__last.visitContracts((c) => { contracts.push(c.name) })
+    } catch (e) { return { ok: false, message: 'Could not read the last compilation.' } }
+    return { ok: true, contracts, environment: this.blockchain.getProvider() }
+  }
+
+  // Deploy a compiled contract. `args` are the constructor arguments in order.
+  // value (SUN) / tokenId+tokenValue fund a payable constructor. `from` picks
+  // the sending account (defaults to the panel's selected account).
+  async aiDeploy ({ contractName, args = [], value, tokenId, tokenValue, from } = {}) {
+    const selectedContract = this._aiSelectedContract(contractName)
+    if (!selectedContract.bytecodeObject || selectedContract.bytecodeObject.length === 0) {
+      throw new Error(`"${contractName}" has no bytecode (it may be abstract or an interface) — it cannot be deployed.`)
+    }
+    const txMeta = this._aiTxMeta({ value, tokenId, tokenValue }) || {}
+    if (txMeta.value) {
+      const ctor = (selectedContract.abi || []).find((f) => f.type === 'constructor')
+      if (!ctor || ctor.stateMutability !== 'payable') {
+        throw new Error(`The ${contractName} constructor is not payable — deploy without value.`)
+      }
+    }
+    const fromAddr = await this._aiResolveFrom(from)
+    if (fromAddr) txMeta.from = fromAddr
+    let contractMetadata = null
+    try { contractMetadata = await this.call('compilerMetadata', 'deployMetadataOf', selectedContract.name, selectedContract.contract.file) } catch (e) { contractMetadata = null }
+    const compilerContracts = this._aiDropdownLogic().getCompilerContracts()
+    const encodedArgs = this._aiEncodeArgs(args)
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      const done = (fn) => { if (!settled) { settled = true; fn() } }
+      const statusCb = (msg) => { try { this.logCallback(msg) } catch (e) {} }
+      const continueCb = (error, continueTxExecution) => {
+        if (error) return done(() => reject(new Error(typeof error === 'string' ? error : (error.message || 'gas estimation failed'))))
+        continueTxExecution()
+      }
+      // Personal-mode passphrase prompts can't be answered programmatically.
+      const promptCb = (okCb, cancelCb) => cancelCb()
+      // Gas confirmation: auto-continue. This is NOT the security gate — the AI
+      // panel already confirmed with the user, and on Injected the wallet
+      // prompts for the real signature next.
+      const confirmationCb = (network, tx, gasEstimation, continueTxExecution) => continueTxExecution()
+      const finalCb = (error, contractObject, address) => {
+        if (error) return done(() => reject(new Error(typeof error === 'string' ? error : (error.message || 'deployment failed'))))
+        // Register the deployed instance in the Deploy & Run panel exactly as
+        // the manual deploy path does (contractDropdown finalCb): otherwise an
+        // AI-deployed contract is live on-chain but has no instance card in the
+        // panel, so the user can't interact with it through the normal UI.
+        // Best-effort — the on-chain deploy has already succeeded either way.
+        try {
+          if (this.contractDropdownUI) {
+            this.contractDropdownUI.event.trigger('clearInstance') // drops the "no instances" notice
+            this.contractDropdownUI.event.trigger('newContractInstanceAdded', [contractObject, address, contractObject.name])
+          }
+          const data = this.compilersArtefacts.getCompilerAbstract(contractObject.contract.file)
+          this.compilersArtefacts.addResolvedContract(helper.addressToString(address), data)
+        } catch (e) { console.error('[aiDeploy] instance UI registration failed (deploy still succeeded):', e) }
+        done(() => resolve({ ok: true, address: address || (contractObject && contractObject.address) || null, contractName }))
+      }
+      // Safety net: never hang the tool loop if a callback path goes silent.
+      setTimeout(() => done(() => reject(new Error('Deployment did not complete in time (the wallet prompt may be waiting, or the network is slow).'))), 180000)
+      try {
+        this.blockchain.deployContractAndLibraries(selectedContract, encodedArgs, contractMetadata, compilerContracts, { continueCb, promptCb, statusCb, finalCb }, confirmationCb, txMeta)
+      } catch (e) { done(() => reject(e)) }
+    })
+  }
+
+  // Resolve the ABI (and, when known, the compiled contract object) for an AI
+  // read/write. Order: an explicit `abi` array (works for contracts whose
+  // source is NOT in the workspace), the address-registered compilation
+  // (aiDeploy registers every deploy there), the last compilation, then any
+  // per-file compilation holding the name — so calling contract A keeps
+  // working after file B was compiled more recently.
+  _aiResolveCallTarget ({ address, contractName, abi }) {
+    if (abi !== undefined && abi !== null) {
+      if (!Array.isArray(abi) || abi.length === 0 || abi.some((e) => !e || typeof e !== 'object' || !e.type)) {
+        throw new Error('abi must be a non-empty JSON ABI array (objects with a "type" field).')
+      }
+      return { abi, object: null }
+    }
+    const findByName = (abstract) => {
+      if (!abstract || typeof abstract.visitContracts !== 'function') return null
+      let hit = null
+      try {
+        abstract.visitContracts((c) => {
+          if (c && c.name === contractName && c.object) { hit = c; return true }
+          return false
+        })
+      } catch (e) { hit = null }
+      return hit
+    }
+    const candidates = []
+    if (this.compilersArtefacts) {
+      if (address) {
+        const forms = [String(address), String(address).toLowerCase()]
+        try { forms.push(helper.addressToString(address)) } catch (e) { /* keep the raw forms */ }
+        for (const f of forms) {
+          try { const hitAbstract = this.compilersArtefacts.get(f); if (hitAbstract) candidates.push(hitAbstract) } catch (e) {}
+        }
+      }
+      candidates.push(this.compilersArtefacts.__last)
+      const perFile = this.compilersArtefacts.compilersArtefactsPerFile || {}
+      for (const file of Object.keys(perFile).reverse()) candidates.push(perFile[file])
+    }
+    for (const cand of candidates) {
+      const hit = findByName(cand)
+      if (hit) return { abi: hit.object.abi, object: hit }
+    }
+    throw new Error(`No compiled contract named "${contractName}". Compile its source file first, or pass the contract's ABI in the "abi" parameter.`)
+  }
+
+  // Call/transact a method on a deployed contract. Reads (view/pure) return the
+  // decoded value; writes return the transaction hash once mined.
+  // value (SUN) / tokenId+tokenValue attach money to a payable method.
+  // `from` picks the sending account (defaults to the panel's selected one).
+  async aiCallMethod ({ address, contractName, method, args = [], readOnly = false, value, tokenId, tokenValue, abi: explicitAbi, from } = {}) {
+    if (!address) throw new Error('Provide the deployed contract address.')
+    const resolved = this._aiResolveCallTarget({ address, contractName, abi: explicitAbi })
+    const abi = resolved.abi
+    const funABI = (abi || []).find((f) => f.type === 'function' && f.name === method)
+    if (!funABI) throw new Error(`No function "${method}" on ${contractName}. Check the ABI / method name.`)
+    const lookupOnly = funABI.stateMutability === 'view' || funABI.stateMutability === 'pure' || funABI.constant === true
+    const txMeta = this._aiTxMeta({ value, tokenId, tokenValue }) || {}
+    if (Object.keys(txMeta).length && lookupOnly) throw new Error(`"${method}" is read-only — a call cannot carry value or tokens.`)
+    if (txMeta.value && funABI.stateMutability !== 'payable') {
+      throw new Error(`"${method}" is not payable — send the transaction without value.`)
+    }
+    const fromAddr = await this._aiResolveFrom(from)
+    if (fromAddr) txMeta.from = fromAddr
+    // read_contract passes readOnly:true — refuse to silently transact a
+    // state-changing method (that path belongs to write_contract, which asks
+    // the user to confirm the signature/gas first).
+    if (readOnly && !lookupOnly) throw new Error(`"${method}" is a state-changing function — use write_contract (it confirms the signature with the user) instead of read_contract.`)
+    const logMsg = `${lookupOnly ? 'call' : 'transact'} to ${contractName}.${method}`
+    const encodedArgs = this._aiEncodeArgs(args)
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let onExecuted = null
+      // Unregister the write listener on EVERY settle path — the gas-error
+      // (continueCb) and errored-log (logCallback) paths previously settled
+      // without cleanup(), leaking a transactionExecuted listener per failed
+      // write. Folding cleanup into done() makes it exactly-once. (Note:
+      // EventManager matches listeners by func.toString(), so this stays
+      // correct only because AI tool calls run sequentially — never two
+      // in-flight writes with identical onExecuted source at once.)
+      const cleanup = () => { if (onExecuted) { try { this.blockchain.event.unregister('transactionExecuted', onExecuted) } catch (e) {}; onExecuted = null } }
+      const done = (fn) => { if (settled) return; settled = true; cleanup(); fn() }
+      const logCallback = (msg) => { try { this.logCallback(msg) } catch (e) {}; if (/errored:/.test(String(msg))) done(() => reject(new Error(String(msg)))) }
+      const outputCb = (returnValue) => {
+        done(() => resolve({ ok: true, kind: 'read', result: this._aiStringifyReturn(returnValue, funABI) }))
+      }
+      const continueCb = (error, continueTxExecution) => {
+        if (error) return done(() => reject(new Error(typeof error === 'string' ? error : (error.message || 'gas estimation failed'))))
+        continueTxExecution()
+      }
+      const promptCb = (okCb, cancelCb) => cancelCb()
+      const confirmationCb = (network, tx, gasEstimation, continueTxExecution) => continueTxExecution()
+
+      // Writes have no explicit completion callback in runOrCallContractMethod;
+      // resolve on the next transactionExecuted for this address.
+      if (!lookupOnly) {
+        onExecuted = (error, from, to, dataObj, isCall, txResult) => {
+          if (isCall) return
+          // Only settle for OUR transaction: the engine can replay a prior
+          // result (a deploy's `to` is null), so require the target address to
+          // match — otherwise we'd resolve on the deploy's replayed event
+          // before store() actually runs, then read stale state.
+          if (!to || String(to).toLowerCase() !== String(address).toLowerCase()) return
+          const hash = txResult && (txResult.transactionHash || (txResult.receipt && txResult.receipt.transactionHash) || txResult.txID)
+          if (error) return done(() => reject(new Error(typeof error === 'string' ? error : (error.message || 'transaction failed'))))
+          // A reverted state-changing tx still produces a receipt — surface it
+          // instead of reporting a false success.
+          const receipt = txResult && (txResult.receipt || txResult)
+          const status = receipt && (receipt.status !== undefined ? receipt.status : (receipt.result !== undefined ? receipt.result : undefined))
+          const reverted = status === false || status === '0x0' || status === 0 || String(status).toUpperCase() === 'FAILED' || String(status).toUpperCase() === 'REVERT'
+          if (reverted) {
+            // Decode WHY it reverted (custom error name+args / require string /
+            // Panic) so the model gets an actionable reason, not a bare
+            // "reverted". The revert data is fetched from the simulator by hash
+            // (async); settle once it resolves.
+            this._aiRevertReason(hash, abi, resolved.object).then((reason) => {
+              done(() => reject(new Error(`${logMsg} ${reason || 'reverted (transaction failed on-chain)'}.`)))
+            })
+            return
+          }
+          done(() => resolve({ ok: true, kind: 'write', txHash: hash || null }))
+        }
+        try { this.blockchain.event.register('transactionExecuted', onExecuted) } catch (e) { /* fall back to timeout */ }
+      }
+
+      setTimeout(() => done(() => reject(new Error(`${logMsg} did not complete in time (the wallet prompt may be waiting, or the network is slow).`))), 180000)
+
+      try {
+        this.blockchain.runOrCallContractMethod(
+          contractName, abi, funABI, resolved.object, encodedArgs, address, encodedArgs, lookupOnly,
+          logMsg, logCallback, outputCb, confirmationCb, continueCb, promptCb, txMeta)
+      } catch (e) { done(() => { cleanup(); reject(e) }) }
+    })
+  }
+
+  // Decode a reverted write's reason from the VM execution result using the
+  // contract ABI (custom errors, Error(string), Panic). Returns a concise
+  // one-line reason or null when nothing decodable is available (e.g. the
+  // injected path, where the wallet/receipt carries no execResult here).
+  // Decode a reverted write's reason (custom error name+args / require string /
+  // Panic) into a concise line. On the JS VM the exec result — with the revert
+  // return data — is not in the transactionExecuted payload; fetch it from the
+  // simulator by tx hash, then reuse checkVMError. Returns null when nothing is
+  // decodable (e.g. the injected path, where web3 has no simulator result).
+  async _aiRevertReason (hash, abi, contractObject) {
+    try {
+      if (!hash) return null
+      const web3 = this.blockchain && this.blockchain.web3 && this.blockchain.web3()
+      if (!web3 || !web3.eth || typeof web3.eth.getExecutionResultFromSimulator !== 'function') return null
+      const execResult = await web3.eth.getExecutionResultFromSimulator(hash)
+      if (!execResult || !execResult.returnValue) return null
+      // contractObject is the compiled contract (its .object holds devdoc/userdoc)
+      // — the same shape blockchain.runTx passes as args.data.contract. May be
+      // null for explicit-abi calls; checkVMError tolerates that.
+      const vmError = execution.txExecution.checkVMError(execResult, abi, contractObject)
+      return (vmError && vmError.reason) || null
+    } catch (e) { return null }
+  }
+
+  _aiStringifyReturn (returnValue, funABI) {
+    try {
+      if (returnValue == null) return null
+      // The VM/injected pipelines deliver the RAW ABI-encoded return bytes
+      // (a Buffer/Uint8Array, sometimes a 0x-hex string). Decode them with the
+      // same decoder the Deploy & Run cards use — indexing the buffer like a
+      // web3-decoded object reads BYTE 0 of the 32-byte word (0 for any small
+      // value), which made every read_contract readback report 0 (DEF-AI-2).
+      const looksLikeRawBytes = (returnValue instanceof Uint8Array) ||
+        (typeof Buffer !== 'undefined' && Buffer.isBuffer(returnValue)) ||
+        (typeof returnValue === 'string' && returnValue.startsWith('0x'))
+      if (looksLikeRawBytes && funABI && funABI.outputs && funABI.outputs.length > 0) {
+        const decoded = execution.txFormat.decodeResponse(returnValue, funABI)
+        if (decoded && decoded.error) return decoded.error
+        return decoded
+      }
+      if (typeof returnValue === 'string' || typeof returnValue === 'number' || typeof returnValue === 'boolean') return returnValue
+      if (returnValue.toString && returnValue._isBigNumber) return returnValue.toString()
+      // web3 decoded object: pick the named/indexed outputs
+      const out = {}
+      const names = (funABI.outputs || []).map((o, i) => o.name || String(i))
+      let any = false
+      for (const n of names) { if (returnValue[n] !== undefined) { out[n] = returnValue[n] && returnValue[n].toString ? returnValue[n].toString() : returnValue[n]; any = true } }
+      if (any) return out
+      return JSON.parse(JSON.stringify(returnValue, (k, v) => (typeof v === 'bigint' ? v.toString() : v)))
+    } catch (e) { return String(returnValue) }
   }
 
   _registerExternalListener (emitter, eventName, handler, scope) {
@@ -224,7 +616,10 @@ export class RunTab extends ViewPlugin {
   }
 
   async disconnectInjectedTronWeb () {
-    if (!this.settingsUI) return { disconnected: true }
+    // Provider events can repeat or race with a user changing environments.
+    // Only tear down an injected context; an existing VM/custom context must
+    // keep its accounts and state intact.
+    if (!this.settingsUI || this.blockchain.getProvider() !== 'injected') return { disconnected: true }
     this.settingsUI.clearAccountsList()
     this.settingsUI.pendingAccountsProvider = 'vm'
     this.settingsUI.loadedAccountsProvider = 'vm'
@@ -339,8 +734,9 @@ export class RunTab extends ViewPlugin {
       this.recorderCount.innerText = count
     })
     this.event.register('clearInstance', recorder.clearAll.bind(recorder))
+    this.event.register('clearInstance', recorder.clearAddressBook.bind(recorder))
 
-    this.recorderInterface = new RecorderUI(this.blockchain, fileManager, recorder, logCallback, config)
+    this.recorderInterface = new RecorderUI(this.blockchain, fileManager, recorder, logCallback, config, this.compilersArtefacts)
 
     this.recorderInterface.event.register('newScenario', (abi, address, contractName) => {
       var noInstancesText = this.noInstancesText
@@ -357,6 +753,93 @@ export class RunTab extends ViewPlugin {
         <div class="ml-2 badge badge-pill badge-primary" title="The number of recorded transactions">${this.recorderCount}</div>
       </div>`
 
+    // Address book: contracts created by recorded/replayed transactions. The
+    // section element is created once and mutated in place (same pattern as
+    // the recorderCount badge), so it stays current across expand/collapse.
+    const addressBookEntries = yo`<div data-id="recorderAddressBookEntries"></div>`
+    const addressBookSection = yo`
+      <div class="mt-2 pt-2 border-top" data-id="recorderAddressBook" style="display: none">
+        <div class="${css.recorderDescription}" title="Contracts created by the recorded or replayed transactions">Deployed contracts</div>
+        ${addressBookEntries}
+      </div>`
+    const renderAddressBook = (book) => {
+      addressBookSection.style.display = book && book.length ? 'block' : 'none'
+      addressBookEntries.innerHTML = ''
+      ;(book || []).forEach((entry) => {
+        const address = util.addressToBase58(entry.address)
+        // both name and address must be allowed to shrink/truncate or a long
+        // contract name pushes the address and copy icon out of the sidebar
+        const copyIcon = copyToClipboard(() => address, 'Copy the deployed address')
+        copyIcon.classList.add('flex-shrink-0')
+        addressBookEntries.appendChild(yo`
+          <div class="d-flex align-items-center" data-id="recorderAddressBookEntry">
+            <span class="mr-1 font-weight-bold text-truncate" style="min-width: 0" data-id="recorderAddressBookName" title="${entry.name}">${entry.name}</span>
+            <span class="text-truncate" style="min-width: 0" data-id="recorderAddressBookAddress" title="${address}">${address}</span>
+            ${copyIcon}
+          </div>`)
+      })
+    }
+    // Deploy flow: per-step status of the last scenario replay. Rows are
+    // created on replayStarted and updated in place; a failed step stops the
+    // flow there, so later rows keep their pending state.
+    const deployFlowSteps = yo`<div data-id="recorderDeployFlowSteps"></div>`
+    const deployFlowSection = yo`
+      <div class="mt-2 pt-2 border-top" data-id="recorderDeployFlow" style="display: none">
+        <div class="${css.recorderDescription}" title="Per-step result of the last scenario replay">Deploy flow</div>
+        ${deployFlowSteps}
+      </div>`
+    const stepIcons = {
+      pending: 'far fa-circle text-muted',
+      running: 'fas fa-spinner fa-spin',
+      success: 'fas fa-check text-success',
+      failed: 'fas fa-times text-danger'
+    }
+    let deployFlowRows = []
+    const resetDeployFlow = () => {
+      deployFlowSection.style.display = 'none'
+      deployFlowSteps.innerHTML = ''
+      deployFlowRows = []
+    }
+
+    const recorder = this.recorderInterface.recorder
+    recorder.event.register('replayStarted', (steps) => {
+      resetDeployFlow()
+      deployFlowSection.style.display = 'block'
+      deployFlowRows = steps.map((step) => {
+        const label = step.type === 'constructor' ? `Deploy ${step.contractName || ''}` : (step.name || step.type)
+        const row = yo`
+          <div class="d-flex align-items-center px-1" data-id="recorderDeployFlowStep" data-status="pending">
+            <i class="mr-1 ${stepIcons.pending}" aria-hidden="true"></i>
+            <span class="text-truncate" style="min-width: 0">${step.index + 1}. ${label}</span>
+          </div>`
+        deployFlowSteps.appendChild(row)
+        return row
+      })
+    })
+    recorder.event.register('replayStepUpdated', (index, status, error) => {
+      const row = deployFlowRows[index]
+      if (!row || !stepIcons[status]) return
+      row.setAttribute('data-status', status)
+      row.querySelector('i').className = `mr-1 ${stepIcons[status]}`
+      if (status === 'failed') {
+        row.classList.add('alert-danger', 'font-weight-bold')
+        if (error) row.title = error
+      }
+    })
+    this.event.register('clearInstance', resetDeployFlow)
+
+    recorder.event.register('addressBookUpdated', renderAddressBook)
+    renderAddressBook(recorder.getAddressBook())
+
+    // Bridge to TronBox: download the recorded flow as a ready-to-migrate
+    // TronBox project (complementary export, not an in-browser CLI).
+    const exportTronboxButton = yo`
+      <button class="btn btn-sm btn-secondary mt-2 align-self-start" data-id="recorderExportTronbox"
+        title="Download this deploy flow as a TronBox project (contracts, migrations, network config)"
+        onclick=${() => this.recorderInterface.exportTronboxProject()}>
+        Export to TronBox
+      </button>`
+
     const expandedView = yo`
       <div class="d-flex flex-column">
         <div class="${css.recorderDescription} mt-2">
@@ -366,8 +849,10 @@ export class RunTab extends ViewPlugin {
         <div class="${css.transactionActions}">
           ${this.recorderInterface.recordButton}
           ${this.recorderInterface.runButton}
-          </div>
         </div>
+        ${deployFlowSection}
+        ${addressBookSection}
+        ${exportTronboxButton}
       </div>`
 
     this.recorderCard = new Card({}, {}, { title: 'Transactions recorded', collapsedView: collapsedView })

@@ -34,6 +34,11 @@ class Recorder {
     self.event = new EventManager()
     self.blockchain = blockchain
     self.data = { _listen: true, _replay: false, journal: [], _createdContracts: {}, _createdContractsReverse: {}, _usedAccounts: {}, _abis: {}, _contractABIReferences: {}, _linkReferences: {} }
+    // Address book of contracts created by recorded/replayed transactions
+    // (contract name -> deployed address). Kept outside clearAll() on purpose:
+    // run() clears the journal when a replay completes, but the addresses it
+    // just deployed are exactly what the user needs afterwards.
+    self.data._addressBook = []
 
     this.blockchain.event.register('initiatingTransaction', (timestamp, tx, payLoad) => {
       if (tx.useCall) return
@@ -82,6 +87,24 @@ class Recorder {
       }
     })
 
+    this.blockchain.event.register('transactionExecuted', (error, from, to, data, call, txResult, timestamp) => {
+      // Stamp the outcome on the recorded entry (records and this event share
+      // the timestamp key). Without it a REVERTED call is indistinguishable
+      // from a successful one downstream — the TronBox export used to emit
+      // reverted calls as live migration steps.
+      if (call) return
+      // EVM-style receipts carry the outcome in `status` (0/'0x0'/false), TRON
+      // ones in `result` ('FAILED'/'REVERT'); the injected runner usually
+      // rejects with an error instead of a receipt (blockchain.js forwards
+      // that error here). Same revert detection as run-tab's aiCallMethod.
+      const receipt = txResult && (txResult.receipt || txResult)
+      const status = receipt && (receipt.status !== undefined ? receipt.status : receipt.result)
+      const failed = !!error || status === 0 || status === '0x0' || status === false ||
+        String(status).toUpperCase() === 'FAILED' || String(status).toUpperCase() === 'REVERT'
+      if (!failed) return
+      const entry = this.data.journal.find((item) => item.timestamp === timestamp)
+      if (entry && entry.record) entry.record.failed = true
+    })
     this.blockchain.event.register('transactionExecuted', (error, from, to, data, call, txResult, timestamp, _payload) => {
       if (error) return console.log(error)
       if (call) return
@@ -91,8 +114,14 @@ class Recorder {
       // save back created addresses for the convertion from tokens to real adresses
       this.data._createdContracts[address] = timestamp
       this.data._createdContractsReverse[timestamp] = address
+      // the same payload reaches here for live recording and for replay
+      // (blockchain.runTx builds it from args.data in both paths)
+      this.data._addressBook.push({ name: (_payload && _payload.contractName) || '(unknown)', address, timestamp })
+      this.event.trigger('addressBookUpdated', [this.getAddressBook()])
     })
     this.blockchain.event.register('contextChanged', this.clearAll.bind(this))
+    // addresses belong to the previous provider/chain once the context changes
+    this.blockchain.event.register('contextChanged', this.clearAddressBook.bind(this))
     this.event.register('newTxRecorded', (count) => {
       this.event.trigger('recorderCountChange', [count])
     })
@@ -109,6 +138,16 @@ class Recorder {
   setListen (listen) {
     this.data._listen = listen
     this.data._replay = !listen
+  }
+
+  /**
+    * Ask the running replay batch to stop BEFORE its next transaction (the one
+    * already in flight cannot be recalled). No-op when nothing is replaying.
+    * The batch then ends through its normal final callback, so `replayEnded`
+    * still fires (with the abort reason) and the recording state is restored.
+    */
+  abortReplay (reason) {
+    if (this.data._replay) this.data._abortReplay = reason || 'Replay aborted'
   }
 
   extractTimestamp (value) {
@@ -172,6 +211,19 @@ class Recorder {
   }
 
   /**
+    * contracts created by recorded/replayed transactions, in creation order
+    *
+    */
+  getAddressBook () {
+    return this.data._addressBook.slice()
+  }
+
+  clearAddressBook () {
+    this.data._addressBook = []
+    this.event.trigger('addressBookUpdated', [[]])
+  }
+
+  /**
     * delete the seen transactions
     *
     */
@@ -201,12 +253,26 @@ class Recorder {
   run (records, accounts, options, abis, linkReferences, confirmationCb, continueCb, promptCb, alertCb, logCallBack, newContractFn) {
     var self = this
     self.setListen(false)
+    self.data._abortReplay = null
     logCallBack(`Running ${records.length} transaction(s) ...`)
+    self.event.trigger('replayStarted', [records.map((tx, index) => ({
+      index,
+      type: tx.record.type,
+      contractName: tx.record.contractName,
+      name: tx.record.name
+    }))])
+    const stepFailed = (index, error) => {
+      const message = typeof error === 'string' ? error : (error && error.message) || String(error)
+      self.event.trigger('replayStepUpdated', [index, 'failed', message])
+    }
     async.eachOfSeries(records, function (tx, index, cb) {
+      if (self.data._abortReplay) { stepFailed(index, self.data._abortReplay); return cb(self.data._abortReplay) }
+      self.event.trigger('replayStepUpdated', [index, 'running'])
       var record = self.resolveAddress(tx.record, accounts, options)
       var abi = abis[tx.record.abi]
       if (!abi) {
         alertCb('cannot find ABI for ' + tx.record.abi + '.  Execution stopped at ' + index)
+        stepFailed(index, 'cannot find ABI')
         // must call cb so eachOfSeries terminates and the final callback
         // (setListen(true)/clearAll) runs — otherwise replay hangs forever and
         // recording stays disabled until reload.
@@ -236,6 +302,7 @@ class Recorder {
       }
       if (!fnABI) {
         alertCb('cannot resolve abi of ' + JSON.stringify(record, null, '\t') + '. Execution stopped at ' + index)
+        stepFailed(index, 'cannot resolve abi')
         return cb('cannot resolve abi')
       }
       if (tx.record.parameters) {
@@ -255,12 +322,14 @@ class Recorder {
           })
         } catch (e) {
           alertCb('cannot resolve input parameters ' + JSON.stringify(tx.record.parameters) + '. Execution stopped at ' + index)
+          stepFailed(index, 'cannot resolve input parameters')
           return cb('cannot resolve input parameters')
         }
       }
       var data = format.encodeData(fnABI, tx.record.parameters, tx.record.bytecode)
       if (data.error) {
         alertCb(data.error + '. Record:' + JSON.stringify(record, null, '\t') + '. Execution stopped at ' + index)
+        stepFailed(index, data.error)
         return cb(data.error)
       }
       logCallBack(`(${index}) ${JSON.stringify(record, null, '\t')}`)
@@ -272,6 +341,10 @@ class Recorder {
           if (err) {
             console.error(err)
             logCallBack(err + '. Execution failed at ' + index)
+            stepFailed(index, err)
+            // stop at the failed step: cb(err) ends the series so the final
+            // callback still restores the recording state (the bare return
+            // here used to leave the recorder wedged in replay mode)
             return cb(err)
           }
           if (rawAddress) {
@@ -281,10 +354,15 @@ class Recorder {
             self.data._createdContractsReverse[tx.timestamp] = address
             newContractFn(abi, address, record.contractName)
           }
+          self.event.trigger('replayStepUpdated', [index, 'success'])
           cb(err)
         }
       )
-    }, () => { self.setListen(true); self.clearAll() })
+    }, (error) => {
+      self.setListen(true)
+      self.clearAll()
+      self.event.trigger('replayEnded', [error || null])
+    })
   }
 
   runScenario (json, continueCb, promptCb, alertCb, confirmationCb, logCallBack, cb) {

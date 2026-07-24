@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-import React, { useRef, useEffect } from 'react' // eslint-disable-line
+import React, { useRef, useEffect, useLayoutEffect } from 'react' // eslint-disable-line
 import { action, FileExplorerContextMenuProps } from './types'
 
 import './css/file-explorer-context-menu.css'
@@ -39,6 +39,7 @@ export const FileExplorerContextMenu = (
     copy,
     paste,
     runScript,
+    formatCode,
     emit,
     pageX,
     pageY,
@@ -47,23 +48,40 @@ export const FileExplorerContextMenu = (
     focus,
     ...otherProps
   } = props
-  const contextMenuRef = useRef(null)
+  const contextMenuRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    contextMenuRef.current.focus()
+    contextMenuRef.current && contextMenuRef.current.focus()
   }, [])
 
-  useEffect(() => {
-    const menuItemsContainer = contextMenuRef.current
-    const boundary = menuItemsContainer.getBoundingClientRect()
+  useLayoutEffect(() => {
+    const positionInsideViewport = () => {
+      const menuItemsContainer = contextMenuRef.current
+      if (!menuItemsContainer) return
 
-    if (
-      boundary.bottom >
-      (window.innerHeight || document.documentElement.clientHeight)
-    ) {
-      menuItemsContainer.style.position = 'fixed'
-      menuItemsContainer.style.bottom = '10px'
-      menuItemsContainer.style.top = null
+      const viewportWidth =
+        window.innerWidth || document.documentElement.clientWidth
+      const viewportHeight =
+        window.innerHeight || document.documentElement.clientHeight
+      const boundary = menuItemsContainer.getBoundingClientRect()
+      const margin = 8
+      const requestedLeft = Number.isFinite(pageX) ? pageX : margin
+      const requestedTop = Number.isFinite(pageY) ? pageY : margin
+      const maxLeft = Math.max(margin, viewportWidth - boundary.width - margin)
+      const maxTop = Math.max(margin, viewportHeight - boundary.height - margin)
+
+      // The menu is position:fixed, so use viewport coordinates and clamp both
+      // axes. The old bottom-only correction could leave a menu under the top
+      // header (or beyond the right edge), making items visible but unclickable.
+      menuItemsContainer.style.left =
+        `${Math.min(Math.max(margin, requestedLeft), maxLeft)}px`
+      menuItemsContainer.style.top =
+        `${Math.min(Math.max(margin, requestedTop), maxTop)}px`
+      menuItemsContainer.style.bottom = 'auto'
     }
+
+    positionInsideViewport()
+    window.addEventListener('resize', positionInsideViewport)
+    return () => window.removeEventListener('resize', positionInsideViewport)
   }, [pageX, pageY])
 
   const filterItem = (item: action) => {
@@ -152,6 +170,9 @@ export const FileExplorerContextMenu = (
                   break
                 case 'Run':
                   runScript(path)
+                  break
+                case 'Format code':
+                  formatCode(path)
                   break
                 case 'Copy':
                   copy(path, type)

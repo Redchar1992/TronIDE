@@ -40,6 +40,16 @@ const openAiVendorConfig={
   'xAI':'https://api.x.ai/v1',
 }
 
+// Optional user-supplied gateway/relay base URL ("请求地址"). Config, not a
+// secret — it comes from the AI panel alongside the key; empty/undefined means
+// the official vendor endpoint. Trailing slashes are stripped so the SDKs'
+// path-joining stays predictable; the user includes whatever path prefix their
+// gateway documents (e.g. /v1), exactly like other AI clients' base-URL field.
+const normalizeBaseUrl = (u) => {
+  const v = String(u || '').trim().replace(/\/+$/, '')
+  return v || undefined
+}
+
 const extractVendorErrorMessage = (err) => {
   if (!err) return 'Unknown error'
   if (typeof err === 'string') return err
@@ -47,6 +57,17 @@ const extractVendorErrorMessage = (err) => {
   if (err.message) return err.message
   return 'Unknown error'
 }
+
+// Version of the IDE's BUNDLED fallback solc (assets/js/soljson.js). Mirrors
+// BUILTIN_SOLC_VERSION in libs/remix-solidity/src/compiler/compiler-utils.ts —
+// this package must not depend on remix-solidity, so the value is mirrored and
+// scripts/check-compiler-source-consistency.cjs fails the build if they drift.
+export const BUILTIN_SOLC_VERSION = '0.8.20'
+
+// The Tron solc version list. Mirrors tronCompilerSourceProvider.versionListURL
+// in libs/remix-solidity (same no-dependency reason as above); the consistency
+// script pins the two together.
+export const TRON_SOLC_LIST_URL = 'https://tronprotocol.github.io/solc-bin/wasm/list.json'
 
 const throwVendorError = (vendor, err) => {
   const message = extractVendorErrorMessage(err)
@@ -80,10 +101,10 @@ export const getOpenaiChat = async ({ messages, apiKey, model, stream }) => {
   return res
 }
 
-export const getOpenaiChatByInstantiation = async ({ messages, apiKey, model, stream, aiModelVendor }) => {
+export const getOpenaiChatByInstantiation = async ({ messages, apiKey, model, stream, aiModelVendor, baseUrl, signal }) => {
   const client = new OpenAI({
     apiKey,
-    baseURL: openAiVendorConfig[aiModelVendor],
+    baseURL: normalizeBaseUrl(baseUrl) || openAiVendorConfig[aiModelVendor],
     dangerouslyAllowBrowser: true
   })
   try {
@@ -94,19 +115,20 @@ export const getOpenaiChatByInstantiation = async ({ messages, apiKey, model, st
         ...messages
       ],
       stream
-    })
+    }, signal ? { signal } : undefined)
   } catch (e) {
     throwVendorError(aiModelVendor || 'OpenAI-compatible', e)
   }
 }
 
 
-export const googleGenAIHandle = async ({ apiKey, model, stream, userContent }) => {
-  const ai = new GoogleGenAI({ apiKey })
+export const googleGenAIHandle = async ({ apiKey, model, stream, userContent, baseUrl, signal }) => {
+  const base = normalizeBaseUrl(baseUrl)
+  const ai = new GoogleGenAI({ apiKey, ...(base ? { httpOptions: { baseUrl: base } } : {}) })
   const params = {
     model,
     contents: userContent,
-    config: { systemInstruction: systemInfo }
+    config: { systemInstruction: systemInfo, ...(signal ? { abortSignal: signal } : {}) }
   }
   try {
     if (stream) return await ai.models.generateContentStream(params)
@@ -122,10 +144,12 @@ export const googleGenAIHandle = async ({ apiKey, model, stream, userContent }) 
   }
 }
 
-export const anthropicAIHandle = async ({ apiKey, model, stream, userContent }) => {
+export const anthropicAIHandle = async ({ apiKey, model, stream, userContent, baseUrl, signal }) => {
+  const base = normalizeBaseUrl(baseUrl)
   const anthropic = new Anthropic({
     apiKey,
-    dangerouslyAllowBrowser: true
+    dangerouslyAllowBrowser: true,
+    ...(base ? { baseURL: base } : {})
   })
   try {
     return await anthropic.messages.create({
@@ -134,8 +158,664 @@ export const anthropicAIHandle = async ({ apiKey, model, stream, userContent }) 
       messages: [{ role: 'user', content: userContent }],
       stream,
       system: systemInfo
-    })
+    }, signal ? { signal } : undefined)
   } catch (err) {
     throwVendorError('Anthropic', err)
+  }
+}
+
+// --- Workspace actions (tool use) -------------------------------------------
+// A deliberately small, safe toolset the chat model may call to operate the
+// IDE workspace. The EXECUTION side lives in the Chat component (it owns the
+// plugin bus and the user-confirmation modal); this module only speaks the
+// Anthropic tool-use protocol. v1 is Anthropic-vendor only and non-streaming —
+// a tool round-trip needs complete messages anyway.
+
+export const AI_WORKSPACE_TOOLS = [
+  {
+    name: 'read_current_file',
+    description: 'Read the file currently open and active in the editor — what the user is looking at "on the left". Use this when the user refers to "this file", "the open file", "the code on the left" etc. WITHOUT giving a path.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'list_open_files',
+    description: 'List the files currently open as editor tabs, and which one is active.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'open_file',
+    description: 'Open an existing workspace file in the editor (a new tab, focused) — what the user means by "open X". This does NOT return the content; use read_file if you also need to see it.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative path, e.g. "contracts/Token.sol"' } },
+      required: ['path']
+    }
+  },
+  {
+    name: 'search_workspace',
+    description: 'Search file CONTENTS across the current workspace (like the Search side panel). Returns matching lines as path + line number + preview. Read-only. Prefer this over reading files one by one when looking for where something is defined or used.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Text (or regex when is_regex is true) to find' },
+        is_regex: { type: 'boolean', description: 'Treat query as a JavaScript regular expression' },
+        match_case: { type: 'boolean', description: 'Case-sensitive match (default false)' },
+        whole_word: { type: 'boolean', description: 'Match whole words only' },
+        include: { type: 'string', description: 'Comma-separated globs to limit files, e.g. "contracts/**/*.sol" or "*.md". Default: every searchable text file.' },
+        max_results: { type: 'number', description: 'Cap on returned matches (default 50, max 200)' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'create_file',
+    description: 'Create or overwrite a text file in the current IDE workspace. The user is shown the path and content and must confirm before anything is written.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative path, e.g. "contracts/Token.sol"' },
+        content: { type: 'string', description: 'The full file content to write' }
+      },
+      required: ['path', 'content']
+    }
+  },
+  {
+    name: 'edit_file',
+    description: 'Make a precise in-place edit to an EXISTING file by replacing an exact snippet of its current text. old_string must match the file verbatim (indentation and whitespace included) and be unique unless replace_all is set. The user is shown a diff and must confirm before it is written. Prefer this over create_file for small changes — do NOT rewrite a whole file to change a few lines.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative path, e.g. "contracts/Token.sol"' },
+        old_string: { type: 'string', description: 'Exact existing text to replace, copied verbatim with its indentation. Must be unique in the file unless replace_all is true.' },
+        new_string: { type: 'string', description: 'The replacement text.' },
+        replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring a unique match (default false).' }
+      },
+      required: ['path', 'old_string', 'new_string']
+    }
+  },
+  {
+    name: 'undo_last_change',
+    description: 'Undo the most recent file change YOU made this session (create / overwrite / edit / delete / rename / save_recording / export_tronbox), restoring the previous state. The user confirms first. If the file was changed after your edit, it will not be undone (so the user\'s later edits are never lost), and a change made in another workspace requires switching back to it first. Use it when the user says "undo that" / "revert your change".',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'delete_file',
+    description: 'Delete a file from the current IDE workspace. Destructive — the user confirms before it is removed.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative path to delete, e.g. "contracts/Old.sol"' } },
+      required: ['path']
+    }
+  },
+  {
+    name: 'rename_file',
+    description: 'Rename or move a file within the current IDE workspace. The user confirms first. Fails if the destination already exists.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Existing workspace-relative path.' },
+        to: { type: 'string', description: 'New workspace-relative path.' }
+      },
+      required: ['from', 'to']
+    }
+  },
+  {
+    name: 'read_file',
+    description: 'Read a text file from the current IDE workspace. A large file returns its start plus its total line count; pass offset/limit to read a specific line range (e.g. to copy an exact snippet from the middle/end of a big file for edit_file). A very long range can be char-capped mid-way — the header then states the line range ACTUALLY delivered and the offset to continue from; trust the header, not the requested range.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative path' },
+        offset: { type: 'number', description: '1-based line to start from — use to read past the truncated start of a large file' },
+        limit: { type: 'number', description: 'How many lines to return from offset (default 400, max 2000)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'list_files',
+    description: 'List the entries of a directory in the current IDE workspace.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative directory; empty for the workspace root' } }
+    }
+  },
+  {
+    name: 'list_workspaces',
+    description: 'List the IDE workspaces (marking the current one) and the starter templates available to create_workspace. Read-only.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'create_workspace',
+    description: 'Create a new IDE workspace and switch to it (other workspaces are untouched). By default it is seeded with the sample contracts; pass a template id (see list_workspaces) to start from a TRON template, or empty:true for an empty workspace. The user confirms first.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The new workspace name (no slashes or special characters).' },
+        template: { type: 'string', description: 'Optional starter template id from list_workspaces (e.g. "trc20-full"). Omit for the default samples.' },
+        empty: { type: 'boolean', description: 'Set true to create an empty workspace (ignored if a template is given).' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'switch_workspace',
+    description: 'Switch to an EXISTING IDE workspace. Read/navigation — no confirm. If the workspace does not exist, the tool returns the list of workspaces that do. To make a new one use create_workspace.',
+    input_schema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'The existing workspace to switch to.' } },
+      required: ['name']
+    }
+  },
+  {
+    name: 'compile_contract',
+    description: 'Compile a Solidity (.sol) file with the built-in TVM/Solidity compiler and return whether it succeeded, plus any errors/warnings. Use this when the user asks to compile/build/check a contract. Runs the same compiler as the toolbar "Compile" button.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative .sol path; omit to compile the file currently open in the editor' } }
+    }
+  },
+  {
+    name: 'set_compiler_version',
+    description: 'Switch the active Solidity compiler to a given version and wait for it to load. Use this to satisfy a "requires different compiler version" error (e.g. OpenZeppelin 5.x needs >= 0.8.20) BEFORE compiling again. Give a released version like "0.8.24" or "0.8.27" (the +commit suffix is optional).',
+    input_schema: {
+      type: 'object',
+      properties: { version: { type: 'string', description: 'A released Solidity version, e.g. "0.8.24" or "0.8.27".' } },
+      required: ['version']
+    }
+  },
+  {
+    name: 'run_static_analysis',
+    description: 'Run the built-in Solidity static analysis (security/best-practice checks) over the LAST compilation and return the findings. Compile the contract first. Findings in imported libraries (@openzeppelin, .deps, node_modules) are excluded by default.',
+    input_schema: {
+      type: 'object',
+      properties: { include_libraries: { type: 'boolean', description: 'Set true to also include findings from imported library code (default false).' } }
+    }
+  },
+  {
+    name: 'run_tests',
+    description: 'Run the workspace Solidity unit tests (files ending in _test.sol, using the remix_tests assertion library) and return a pass/fail summary with the failing assertions. Give a specific _test.sol file or a folder in "path"; omit it to run the whole "tests" folder. Each file is compiled and executed on the JavaScript VM. Use it after changing a contract or its tests to check they still pass.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'A _test.sol file or a folder of them (e.g. "tests" or "tests/Ballot_test.sol"). Omit to run the default "tests" folder.' } }
+    }
+  },
+  {
+    name: 'git_status',
+    description: 'Show the local git status of the current workspace: current branch and the staged/unstaged/untracked file lists. Read-only.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'git_diff',
+    description: 'Show line-level changes in the working tree vs the last commit (HEAD) as a unified diff. Optionally limit to one file. Read-only. Use it to see WHAT changed (e.g. before writing a commit message or reviewing edits) — git_status only lists which files changed.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative file to diff, e.g. "contracts/Token.sol". Omit for all changed files.' } }
+    }
+  },
+  {
+    name: 'git_log',
+    description: 'Show recent local git commits (most recent first) of the current workspace. Read-only.',
+    input_schema: {
+      type: 'object',
+      properties: { limit: { type: 'number', description: 'How many commits to return (default 10, max 50).' } }
+    }
+  },
+  {
+    name: 'git_stage_all',
+    description: 'Stage all current changes in the workspace git repo (like the panel "Stage all"). The user is asked to confirm first. Local only.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'git_stage',
+    description: 'Stage specific files by path in the workspace git repo (a subset, unlike git_stage_all). A file deleted from the working tree is removed from the index. The user is asked to confirm first. Local only.',
+    input_schema: {
+      type: 'object',
+      properties: { paths: { type: 'array', description: 'Workspace-relative file paths to stage, e.g. ["contracts/Token.sol"].', items: { type: 'string' } } },
+      required: ['paths']
+    }
+  },
+  {
+    name: 'git_commit',
+    description: 'Commit the currently staged changes with a message. The user is asked to confirm the commit first. Local only — this never pushes.',
+    input_schema: {
+      type: 'object',
+      properties: { message: { type: 'string', description: 'The commit message.' } },
+      required: ['message']
+    }
+  },
+  {
+    name: 'git_create_branch',
+    description: 'Create a new local git branch and switch to it. The user is asked to confirm first (switching branches can touch working files).',
+    input_schema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'New branch name, e.g. "feature-x".' } },
+      required: ['name']
+    }
+  },
+  {
+    name: 'git_checkout',
+    description: 'Switch to an EXISTING local branch. The user confirms first (checkout replaces working-tree files and can overwrite uncommitted edits). To create a new branch use git_create_branch instead. If the branch does not exist, the tool returns the list of branches that do.',
+    input_schema: {
+      type: 'object',
+      properties: { branch: { type: 'string', description: 'The existing branch to switch to, e.g. "main".' } },
+      required: ['branch']
+    }
+  },
+  {
+    name: 'git_push',
+    description: 'Push the current (or named) branch to the configured remote (origin), publishing your commits. OUTWARD-FACING: the user confirms first. Requires a connected GitHub account and a remote. A non-fast-forward push is rejected — pull first (or force).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        branch: { type: 'string', description: 'Branch to push (defaults to the current branch).' },
+        force: { type: 'boolean', description: 'Force-push (can overwrite remote history — only when the user explicitly asks).' }
+      }
+    }
+  },
+  {
+    name: 'git_pull',
+    description: 'Fetch and merge the current (or named) branch from the configured remote (origin) into the working tree. The user confirms first (it can overwrite local files and create a merge commit). Requires a connected GitHub account and a remote.',
+    input_schema: {
+      type: 'object',
+      properties: { branch: { type: 'string', description: 'Branch to pull (defaults to the current branch).' } }
+    }
+  },
+  {
+    name: 'git_clone',
+    description: 'Clone a public (or, with GitHub connected, private) git repository over https into a NEW workspace and switch to it. The current workspace is left untouched. The user confirms first. Shallow single-branch clone. Give the full https URL; returns the new workspace name.',
+    input_schema: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'The full https repository URL, e.g. https://github.com/owner/repo.git' } },
+      required: ['url']
+    }
+  },
+  {
+    name: 'debug_transaction',
+    description: 'Open the Debugger on a transaction hash and return a summary of the execution trace: step count and gas, the storage writes (slot=value) and read count, and — if it reverted — the decoded reason (require string or Panic code). Use this when the user wants to debug or inspect a past transaction. Read-only.',
+    input_schema: {
+      type: 'object',
+      properties: { tx_hash: { type: 'string', description: 'The transaction hash to debug (0x… or a TRON tx id).' } },
+      required: ['tx_hash']
+    }
+  },
+  {
+    name: 'list_accounts',
+    description: 'List the accounts in the current environment with their TRX balances. On the JavaScript VM these are the deterministic funded accounts; on Injected it is the connected wallet. Use this to pick a sender for deploy_contract/write_contract (their "from") or to check a balance before sending.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_balance',
+    description: 'Get the TRX balance of a single address in the current environment. Read-only.',
+    input_schema: {
+      type: 'object',
+      properties: { address: { type: 'string', description: 'The address to check.' } },
+      required: ['address']
+    }
+  },
+  {
+    name: 'list_deployable_contracts',
+    description: 'List the contracts available to deploy from the last successful compilation, and the current deployment environment (JavaScript VM or Injected wallet). Compile first.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'deploy_contract',
+    description: 'Deploy a compiled contract with the current environment (JavaScript VM, or the connected wallet on Injected). The user confirms before it deploys, and on a real wallet the wallet also prompts to sign. Compile the contract first. Returns the deployed address.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contract_name: { type: 'string', description: 'The contract to deploy, e.g. "Storage".' },
+        args: { type: 'array', description: 'Constructor arguments in order (omit if the constructor takes none).', items: {} },
+        value: { type: 'string', description: 'TRX to send with the deployment, as an integer amount of SUN (1 TRX = 1,000,000 SUN). Only for a payable constructor; omit otherwise.' },
+        token_id: { type: 'string', description: 'TRC10 token id to send with the deployment (needs token_value). Omit unless the user asked to send a TRC10 token.' },
+        token_value: { type: 'string', description: 'TRC10 amount in the token\'s raw units (needs token_id).' },
+        from: { type: 'string', description: 'Account to deploy from (an address from list_accounts). Omit to use the account selected in Deploy & Run.' }
+      },
+      required: ['contract_name']
+    }
+  },
+  {
+    name: 'read_contract',
+    description: 'Call a view/pure (read-only) function on a deployed contract and return the value. Free, no signature. Give the deployed address, the contract name (for its ABI) and the method. If the contract\'s source is not compiled in this workspace, pass its JSON ABI array in "abi". For state-changing functions use write_contract instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: 'The deployed contract address.' },
+        contract_name: { type: 'string', description: 'The compiled contract name (for the ABI).' },
+        method: { type: 'string', description: 'The view/pure function name to call.' },
+        args: { type: 'array', description: 'Function arguments in order.', items: {} },
+        abi: { type: 'array', description: 'Optional JSON ABI array for the contract. Use when its source is not compiled in this workspace (e.g. the user pasted an ABI or the contract is verified elsewhere).', items: {} },
+        from: { type: 'string', description: 'Account to call from (an address from list_accounts); affects msg.sender. Omit for the selected account.' }
+      },
+      required: ['address', 'contract_name', 'method']
+    }
+  },
+  {
+    name: 'write_contract',
+    description: 'Send a STATE-CHANGING transaction to a deployed contract (e.g. store, mint, transfer). Costs gas and, on a real wallet, prompts a signature. The user confirms before it runs. Give the deployed address, the contract name (for its ABI), the method, and any args. Returns the transaction hash once mined; a revert is reported as a failure.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: 'The deployed contract address.' },
+        contract_name: { type: 'string', description: 'The compiled contract name (for the ABI).' },
+        method: { type: 'string', description: 'The state-changing function name to call.' },
+        args: { type: 'array', description: 'Function arguments in order.', items: {} },
+        value: { type: 'string', description: 'TRX to send with the call, as an integer amount of SUN (1 TRX = 1,000,000 SUN). Only for a payable method (deposit etc.); omit otherwise.' },
+        token_id: { type: 'string', description: 'TRC10 token id to send with the call (needs token_value). Omit unless the user asked to send a TRC10 token.' },
+        token_value: { type: 'string', description: 'TRC10 amount in the token\'s raw units (needs token_id).' },
+        abi: { type: 'array', description: 'Optional JSON ABI array for the contract. Use when its source is not compiled in this workspace.', items: {} },
+        from: { type: 'string', description: 'Account to send from (an address from list_accounts). Omit to use the account selected in Deploy & Run.' }
+      },
+      required: ['address', 'contract_name', 'method']
+    }
+  },
+  {
+    name: 'check_verification',
+    description: 'Check whether a deployed contract is source-verified on TronScan for an explicit TRON network. Read-only. Returns verified/not-verified (or not-found). Never guess the network from unrelated panel state.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: 'The deployed TRON contract address (T... or 41... hex).' },
+        network: { type: 'string', enum: ['mainnet', 'nile', 'shasta'], description: 'The network where this contract was deployed.' }
+      },
+      required: ['address', 'network']
+    }
+  },
+  {
+    name: 'prepare_verification',
+    description: 'Prepare reference metadata for TronScan source verification from the last compilation (standard-JSON source + compiler settings + address + explicit network). This WRITES a workspace JSON file after confirmation and undo_last_change can reverse it. Returns the matching network\'s TronScan verify URL. IMPORTANT: TronScan does not accept this JSON as the contract upload; the user must download the flattened .sol from Contract Verification, upload it under Contract File(s), and manually match the metadata fields. Compile the contract first.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: { type: 'string', description: 'The deployed TRON contract address (T... or 41... hex).' },
+        network: { type: 'string', enum: ['mainnet', 'nile', 'shasta'], description: 'The network where this contract was deployed.' },
+        contract_name: { type: 'string', description: 'Which compiled contract to verify (defaults to a deployable contract in the root source file).' },
+        source_file: { type: 'string', description: 'Source path when more than one compiled file defines the same contract name.' }
+      },
+      required: ['address', 'network']
+    }
+  },
+  {
+    name: 'save_recording',
+    description: 'Save the recorded deploy/interaction flow (every deploy_contract / write_contract is auto-recorded) to a workspace scenario.json file, so it can be replayed later or exported. This WRITES a workspace file: the user confirms first (an overwrite of an existing file is called out), and undo_last_change can reverse it.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative .json path to write (default "scenario.json").' } }
+    }
+  },
+  {
+    name: 'replay_recording',
+    description: 'Replay a saved scenario.json — RE-EXECUTE its recorded transactions (deploys/calls) to rebuild on-chain state. The user confirms once before the whole batch runs. Finishing a replay CLEARS the unsaved live recording (save_recording first to keep it), and only one replay can run at a time. If it reports a timeout, the batch was aborted — check on-chain state before replaying again. Use it to reproduce a setup on a fresh VM or after switching environments.',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Workspace-relative scenario file to replay (default "scenario.json").' } }
+    }
+  },
+  {
+    name: 'export_tronbox',
+    description: 'Export the recorded deploy/interaction flow into the workspace as a runnable TronBox project — a migration script, tronbox-config.js pinned to the compiled solc version, the workspace contracts, and scaffolding. Every deploy_contract / write_contract you run is auto-recorded, so after building a working flow in the VM, this turns it into a real, deployable project (files under a folder, not a zip download). The user confirms the write first; exporting into an existing folder REPLACES it (stale files from an older export are deleted) and undo_last_change can restore the previous state. Falls back to an open scenario.json if nothing was recorded this session.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dir: { type: 'string', description: 'Workspace folder to write the project into (default "tronbox-project").' }
+      }
+    }
+  }
+]
+
+const workspaceToolsNote = `
+You can operate the user's IDE workspace with the provided tools:
+- read_current_file: the file the user currently has open/active in the editor. Prefer this when the
+  user says "this file", "the open file", "the code on the left" without naming a path.
+- list_open_files: which files are open as tabs (and which is active).
+- open_file: OPEN a file in the editor for the user (use this for "open X"/"show me X in the editor" —
+  do not read_file just to satisfy an "open" request).
+- list_files / read_file: browse and read any file by workspace-relative path (e.g. "contracts/Token.sol").
+  For a large file, read_file returns the start and the total line count — pass offset/limit to read a
+  specific range (do this before edit_file on a big file so old_string matches the real current text).
+  If a paged read is char-capped, the header names the range actually delivered and the offset to
+  continue from — continue from THAT offset; never assume you saw lines past it.
+- search_workspace: find text/code ACROSS files (returns path + line + preview). Use it FIRST when you
+  need to locate where something is defined or used — do not read files one by one to look for a string.
+- list_workspaces / create_workspace / switch_workspace: manage IDE workspaces. list_workspaces shows
+  them (and the create templates); create_workspace makes a new one (optionally from a template) and
+  switches to it (confirmed); switch_workspace moves to an existing one (no confirm). Files/contracts
+  live per-workspace, so switch to the right one before compiling/deploying.
+- create_file: create/overwrite a file. Every write is shown to the user for confirmation first; if the
+  user rejects it, do not retry the same write.
+- edit_file: change PART of an existing file by replacing an exact snippet (old_string → new_string),
+  shown to the user as a diff to confirm. Prefer it over create_file for small changes — never rewrite a
+  whole file to touch a few lines. Copy old_string verbatim (indentation/whitespace included); it must be
+  unique unless replace_all. If it reports "not found", read_file first to get the exact current text;
+  if it reports the file changed while the confirmation was open, re-read and re-apply it once.
+- delete_file / rename_file: remove or rename/move a workspace file. Both are confirmed by the user
+  (delete is destructive; rename fails if the destination already exists). Do not delete files the user
+  did not ask you to.
+- undo_last_change: reverse your most recent file change (create/overwrite/edit/delete/rename, and
+  save_recording/export_tronbox writes). Use it when the user asks to undo or revert what you just did.
+  It refuses if the file changed after your edit (so it never overwrites the user's own later edits) and
+  is per-workspace — switch back to the workspace the change was made in first.
+- compile_contract: compile a .sol file (omit the path to compile the open file) and read back
+  errors/warnings — the same compiler as the toolbar Compile button.
+- set_compiler_version: switch the compiler to a released version (e.g. "0.8.24") and wait for it to
+  load. For a "requires different compiler version" error, set a version that satisfies the pragma
+  (pick the newest, e.g. 0.8.27) and then compile_contract again — do NOT rewrite the contract to
+  downgrade its pragma just to fit an old compiler.
+- run_static_analysis: after a successful compile, run the security/best-practice analyzer and report
+  the findings (library findings are excluded by default). Use it when the user asks to "analyze",
+  "audit", "check for vulnerabilities/issues".
+- run_tests: run the workspace Solidity unit tests (_test.sol files, remix_tests assertions) and report
+  passing/failing counts plus the failing assertions. Omit path for the whole "tests" folder, or pass a
+  single _test.sol file / folder. Use it for "run the tests" or to confirm a change didn't break them.
+- git_status / git_log: read the local repo state and recent commits.
+- git_diff: see the actual line-level changes (working tree vs HEAD), optionally for one file. Run it
+  before writing a commit message or when the user asks what changed — git_status only names files.
+- git_stage_all / git_stage / git_commit / git_create_branch / git_checkout: local version control.
+  git_stage stages specific files (git_stage_all stages everything). git_create_branch makes a NEW
+  branch; git_checkout switches to an EXISTING one. Commits and branch switches are confirmed by the
+  user. Do not invent a commit message — use what the user asked for, or a short, accurate summary of
+  the change.
+- git_push / git_pull: sync with the remote (origin) over the connected GitHub account. Both are
+  confirmed by the user — push publishes commits outward; pull merges remote changes into the working
+  tree. If they fail with "add a remote", the user has not connected GitHub / added a remote yet.
+- git_clone: clone an https repo into a NEW workspace and switch to it (the current workspace is left
+  intact). Confirmed by the user. Use it for "clone this repo and …"; public repos need no auth,
+  private repos need "Connect to GitHub" first.
+- debug_transaction: open the Debugger on a tx hash and summarize the trace. Use it for "debug"/"why did
+  this tx fail/revert".
+- list_accounts / get_balance: list the environment's accounts with TRX balances, or read one address's
+  balance. Use list_accounts to pick a sender for deploy_contract/write_contract (pass its address as
+  "from") or to check funds before sending. Omitting "from" uses the account selected in Deploy & Run.
+- list_deployable_contracts / deploy_contract: after compiling, list the contracts and deploy one. Deploy
+  is confirmed by the user (and the wallet signs on a real network). Report the deployed address.
+- read_contract: call a view/pure (read-only) function and return the value (free, no signature). You need
+  the deployed ADDRESS (from a deploy_contract you just did, or from the user) and the contract NAME for
+  the ABI. read_contract is read-only; it refuses state-changing methods.
+- write_contract: SEND a state-changing transaction to a deployed contract (store/mint/transfer/…). It
+  costs gas and the user confirms first (a real wallet also prompts to sign). Same address + contract
+  name + method + args as read_contract. Use it to exercise a contract after deploying — e.g. deploy,
+  write_contract to store a value, then read_contract to verify it. Returns the tx hash; a revert is
+  reported as a failure WITH the decoded reason — the custom error name and args, the require/revert
+  string, or the Panic code — so you can fix the inputs (do not retry a revert without changing them).
+  For a payable method pass
+  'value' in SUN (1 TRX = 1,000,000 SUN; e.g. "1.5 TRX" -> value "1500000"); deploy_contract takes the
+  same 'value' for a payable constructor. TRC10 transfers use token_id + token_value together. The
+  amount is shown to the user in the confirmation — never send value to a non-payable target. If a
+  contract's source is not compiled in this workspace, read_contract/write_contract accept its JSON ABI
+  array in the "abi" parameter (ask the user for the ABI if you do not have it).
+- check_verification: check if a deployed contract is source-verified on TronScan for the explicit network
+  supplied with the address. Never infer it from the Contract Verification panel's previous selection.
+- save_recording / replay_recording: your deploy_contract / write_contract calls are auto-recorded;
+  save_recording snapshots them to a scenario.json (a confirmed file write, undoable), and
+  replay_recording re-executes a scenario to rebuild the same on-chain state (the user confirms the
+  batch first). Finishing a replay CLEARS the unsaved live recording — save_recording first if the user
+  wants to keep it. Only one replay runs at a time; a timed-out replay is aborted between transactions —
+  check on-chain state (read_contract / get_balance) before replaying again, never blind-retry.
+- export_tronbox: turn the recorded deploy/interaction flow into a runnable TronBox project in the
+  workspace (migration + config pinned to the compiled solc + the contracts). Your deploy_contract /
+  write_contract calls are auto-recorded, so once a flow works in the VM, export it to hand the user a
+  real deployable project. The user confirms the write; re-exporting into an existing folder replaces
+  it and deletes stale files from the older export (undo_last_change restores the previous state).
+  Compile first so the pinned solc version is correct.
+- prepare_verification: save reference metadata (standard-JSON source + settings) for a deployed contract
+  and its explicit mainnet/nile/shasta network to a workspace file, then give the user the matching TronScan
+  verify URL. Never infer the network from old panel state. TronScan does NOT accept that JSON as
+  the contract upload: tell the user to download the flattened .sol from Contract Verification, upload it
+  under Contract File(s), and manually match the compiler/settings fields. There is no package paste box.
+Deploy/interact use the current environment shown in list_deployable_contracts — do NOT switch networks;
+if the user wants a different network they set it in Deploy & Run. Never invent a contract address.
+Imports like @openzeppelin resolve to their LATEST major (v5.x): Counters was removed (use a plain
+uint256 counter), and _burn / tokenURI / _beforeTokenTransfer overrides changed (v5 uses _update and
+_increaseBalance). If a contract uses v4-era APIs, fix it to the v5 API rather than looping.
+Work efficiently: don't repeat an identical compile or edit; if the same error persists after a real
+attempt, explain it to the user instead of retrying. After using tools, briefly summarize what you did.`
+
+/**
+ * Non-streaming Anthropic chat loop with workspace tools. Runs up to
+ * `maxIters` model turns, executing requested tools through `executeTool`
+ * (name, input) => Promise<string> between turns. Returns the concatenated
+ * assistant text (tool activity is appended as quoted status lines).
+ */
+export const anthropicChatWithTools = async ({ apiKey, model, baseUrl, userContent, history = [], executeTool, onProgress, maxIters = 12, maxTokens = 8192, signal }) => {
+  // Live transcript callback: fired with the accumulated `out` as model text
+  // arrives and around each tool step, so the UI can show the run in progress
+  // instead of a bare spinner. Best-effort — a throwing UI callback must never
+  // break the tool loop.
+  const report = (text) => { if (onProgress && text) { try { onProgress(text) } catch (e) { /* ignore UI errors */ } } }
+  const base = normalizeBaseUrl(baseUrl)
+  const anthropic = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, ...(base ? { baseURL: base } : {}) })
+  // Prior turns (plain {role, content} text messages) precede the new user
+  // message so the model keeps context across messages — a deployed address,
+  // a file it created, etc. Only well-formed text turns are carried.
+  const priorTurns = (Array.isArray(history) ? history : [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content }))
+  const messages = [...priorTurns, { role: 'user', content: userContent }]
+  let out = ''
+  try {
+    for (let i = 0; i < maxIters; i++) {
+      if (signal && signal.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e }
+      const res = await anthropic.messages.create({
+        model,
+        max_tokens: maxTokens,
+        system: systemInfo + workspaceToolsNote,
+        tools: AI_WORKSPACE_TOOLS,
+        messages,
+        stream: false
+      }, signal ? { signal } : undefined)
+      const blocks = res?.content || []
+      for (const b of blocks) { if (b.type === 'text' && b.text) out += (out ? '\n' : '') + b.text }
+      const toolUses = blocks.filter((b) => b.type === 'tool_use')
+      if (res?.stop_reason !== 'tool_use' || !toolUses.length) return out
+      report(out)
+      messages.push({ role: 'assistant', content: blocks })
+      const results = []
+      for (const t of toolUses) {
+        const head = `> ${t.name}${(t.input && t.input.path) ? ' ' + t.input.path : ''}`
+        // Show the step as "running" before it executes, so the user sees which
+        // tool is in flight (compiles/deploys/reads can take a while).
+        const running = `\n\n${head} …`
+        if (onProgress) { out += running; report(out) }
+        let result
+        try {
+          result = await executeTool(t.name, t.input || {})
+        } catch (e) {
+          // An abort during a tool (e.g. Esc while a compile is running) must
+          // stop the whole loop, not be reported to the model as a tool failure.
+          if (e?.name === 'AbortError' || (signal && signal.aborted)) throw e
+          result = 'Tool failed: ' + ((e && e.message) || e)
+        }
+        const finished = `\n\n${head} — ${String(result).slice(0, 160)}`
+        if (onProgress) {
+          // Replace the "running" placeholder with the finished line, so the
+          // final `out` is identical to the non-onProgress path.
+          const at = out.lastIndexOf(running)
+          out = (at >= 0 ? out.slice(0, at) : out) + finished
+          report(out)
+        } else {
+          out += finished
+        }
+        results.push({ type: 'tool_result', tool_use_id: t.id, content: String(result ?? '') })
+      }
+      messages.push({ role: 'user', content: results })
+    }
+    return out + `\n\n(Stopped after ${maxIters} tool steps. If a compile error is still unresolved, it is likely a real code issue that needs a closer look — tell the user where it stands and what is blocking, rather than continuing to loop.)`
+  } catch (err) {
+    if (err?.name === 'AbortError' || (signal && signal.aborted)) throw err
+    throwVendorError('Anthropic', err)
+  }
+}
+
+// Lightweight, non-streaming code completion (FIM-style). Reuses the same
+// vendor/model/apiKey selection as the chat path, but with a dedicated
+// terse system prompt, a low token budget and low temperature so the model
+// returns only the missing code. Supports cancellation through `signal`
+// (an AbortController signal) so superseded keystroke requests are dropped.
+const completionSystemInfo = `You are a Solidity code-completion engine for the TRON TVM.
+Given a snippet split into a <prefix> (code before the cursor) and a <suffix>
+(code after the cursor), return ONLY the code that should be inserted at the
+cursor to continue the prefix. Do not repeat the prefix or the suffix. Do not
+add explanations, comments about your reasoning, or markdown code fences.
+Keep the completion short (a single statement or a few lines).`
+
+export const complete = async ({ apiKey, model, aiModelVendor, prefix, suffix = '', signal, maxTokens = 64, baseUrl }) => {
+  if (!apiKey) throw new Error('AI key is not set')
+  const userContent = `<prefix>${prefix}</prefix>\n<suffix>${suffix}</suffix>`
+  const openSDKList = ['OpenAI', 'DeepSeek', 'Qwen', 'xAI']
+  const base = normalizeBaseUrl(baseUrl)
+
+  try {
+    if (openSDKList.includes(aiModelVendor)) {
+      const client = new OpenAI({
+        apiKey,
+        baseURL: base || openAiVendorConfig[aiModelVendor],
+        dangerouslyAllowBrowser: true
+      })
+      const res = await client.chat.completions.create({
+        model,
+        messages: [
+          { role: 'system', content: completionSystemInfo },
+          { role: 'user', content: userContent }
+        ],
+        max_tokens: maxTokens,
+        temperature: 0,
+        stream: false
+      }, signal ? { signal } : undefined)
+      return res?.choices?.[0]?.message?.content || ''
+    }
+
+    if (aiModelVendor === 'Google') {
+      const ai = new GoogleGenAI({ apiKey, ...(base ? { httpOptions: { baseUrl: base } } : {}) })
+      const res = await ai.models.generateContent({
+        model,
+        contents: userContent,
+        config: {
+          systemInstruction: completionSystemInfo,
+          maxOutputTokens: maxTokens,
+          temperature: 0,
+          abortSignal: signal
+        }
+      })
+      return res?.text || ''
+    }
+
+    // Default: Anthropic
+    const anthropic = new Anthropic({ apiKey, dangerouslyAllowBrowser: true, ...(base ? { baseURL: base } : {}) })
+    const res = await anthropic.messages.create({
+      model,
+      max_tokens: maxTokens,
+      temperature: 0,
+      system: completionSystemInfo,
+      messages: [{ role: 'user', content: userContent }]
+    }, signal ? { signal } : undefined)
+    return res?.content?.[0]?.text || ''
+  } catch (err) {
+    // Cancellation is expected and must stay silent for the caller.
+    if (err?.name === 'AbortError' || signal?.aborted) {
+      const abort = new Error('aborted')
+      abort.name = 'AbortError'
+      throw abort
+    }
+    throwVendorError(aiModelVendor || 'Anthropic', err)
   }
 }

@@ -49,32 +49,16 @@ module.exports = {
       })
   },
 
-  'Should add new github access token': function (browser: NightwatchBrowser) {
+  // The gist access-token panel was retired from Settings (GitHub tokens are
+  // memory-only, managed by the Home/header Connect GitHub flow), so make sure
+  // it is actually gone.
+  'Should not render the retired gist token panel': function (browser: NightwatchBrowser) {
     browser.waitForElementVisible('*[data-id="verticalIconsKindsettings"]', 5000)
       .click('*[data-id="verticalIconsKindsettings"]')
-      .setValue('*[data-id="settingsTabGistAccessToken"]', '**********')
-      .click('*[data-id="settingsTabSaveGistToken"]')
-      .waitForElementVisible('*[data-shared="tooltipPopup"]', 5000)
-      .assert.containsText('*[data-shared="tooltipPopup"]', 'Access token has been saved')
-      .pause(3000)
-  },
-
-  'Should copy github access token to clipboard': function (browser: NightwatchBrowser) {
-    browser.waitForElementVisible('*[data-id="verticalIconsKindsettings"]', 5000)
-      .click('*[data-id="copyToClipboardCopyIcon"]')
-      .waitForElementVisible('*[data-shared="tooltipPopup"]', 5000)
-      // .waitForElementVisible('*[data-shared="tooltipPopup"]:nth-last-of-type(1) , 5000)
-      // .assert.containsText('*[data-shared="tooltipPopup"]', 'Copied value to clipboard.')
-      // .assert.containsText('*[data-shared="tooltipPopup"]:nth-last-of-type(1)', 'Copied value to clipboard.')
-  },
-
-  'Should remove github access token': function (browser: NightwatchBrowser) {
-    browser.waitForElementVisible('*[data-id="verticalIconsKindsettings"]', 5000)
-      .pause(1000)
-      .click('*[data-id="settingsTabRemoveGistToken"]')
-      .waitForElementVisible('*[data-shared="tooltipPopup"]', 5000)
-      .assert.containsText('*[data-shared="tooltipPopup"]', 'Access token removed')
-      .assert.containsText('*[data-id="settingsTabGistAccessToken"]', '')
+      .waitForElementVisible('*[data-id="settingsTabThemePanel"]', 5000)
+      .assert.not.elementPresent('*[data-id="settingsTabGistAccessToken"]')
+      .assert.not.elementPresent('*[data-id="settingsTabSaveGistToken"]')
+      .assert.not.elementPresent('*[data-id="settingsTabRemoveGistToken"]')
   },
 
   'Should load dark theme': function (browser: NightwatchBrowser) {

@@ -74,6 +74,7 @@ export interface FileExplorerContextMenuProps {
   publishFolderToGist?: (path?: string, type?: string) => void,
   publishFileToGist?: (path?: string, type?: string) => void,
   runScript?: (path: string) => void,
+  formatCode?: (path: string) => void,
   emit?: (cmd: customAction) => void,
   pageX: number,
   pageY: number,

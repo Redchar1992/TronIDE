@@ -35,6 +35,7 @@ import { SidePanel } from './app/components/side-panel'
 import { HiddenPanel } from './app/components/hidden-panel'
 import { VerticalIcons } from './app/components/vertical-icons'
 import { LandingPage } from './app/ui/landing-page/landing-page'
+import { ReleaseNotes } from './app/ui/release-notes/release-notes'
 import { MainPanel } from './app/components/main-panel'
 import { AiPanel } from './app/components/ai-panel'
 import { HeaderPanel } from './app/components/header-panel'
@@ -50,6 +51,7 @@ const remixLib = require('@remix-project/remix-lib')
 const registry = require('./global/registry')
 
 const QueryParams = require('./lib/query-params')
+const { filterUrlPluginNames, parseUrlPluginCall } = require('./lib/url-param-security')
 const GistHandler = require('./lib/gist-handler')
 const normalizeGistId = require('./lib/normalize-gist-id')
 const Storage = remixLib.Storage
@@ -72,6 +74,8 @@ const SettingsTab = require('./app/tabs/settings-tab')
 const AnalysisTab = require('./app/tabs/analysis-tab')
 const { DebuggerTab } = require('./app/tabs/debugger-tab')
 const { ContractVerificationTab } = require('./app/tabs/contract-verification-tab')
+const { GitPanelTab } = require('./app/tabs/git-panel-tab')
+const { SolidityUmlTab } = require('./app/tabs/solidity-uml-tab')
 const TestTab = require('./app/tabs/test-tab')
 const FilePanel = require('./app/panels/file-panel')
 const Editor = require('./app/editor/editor')
@@ -188,6 +192,11 @@ class App {
     // load app config
     const config = new Config(configStorage)
     registry.put({ api: config, name: 'config' })
+
+    // The legacy Settings-tab gist PAT channel is retired (GitHub tokens are
+    // tab-scoped now): scrub any token an older version persisted in config so
+    // no GitHub secret keeps living in browser storage.
+    try { config.set('settings/gist-access-token', '') } catch (e) { console.debug('purge legacy gist token', e) }
 
     // load file system
     self._components.filesProviders = {}
@@ -397,6 +406,7 @@ async function run () {
   const pluginManagerComponent = new PluginManagerComponent(appManager, engine)
   const filePanel = new FilePanel(appManager)
   const landingPage = new LandingPage(appManager, menuicons, fileManager, filePanel)
+  const releaseNotes = new ReleaseNotes()
   const settings = new SettingsTab(
     registry.get('config').api,
     editor,
@@ -414,6 +424,7 @@ async function run () {
   engine.register([
     menuicons,
     landingPage,
+    releaseNotes,
     hiddenPanel,
     sidePanel,
     aiPanel,
@@ -582,6 +593,8 @@ async function run () {
   const analysis = new AnalysisTab(registry)
   const debug = new DebuggerTab()
   const contractVerification = new ContractVerificationTab()
+  const gitPanel = new GitPanelTab()
+  const solidityUml = new SolidityUmlTab()
   const test = new TestTab(
     registry.get('filemanager').api,
     registry.get('offsettolinecolumnconverter').api,
@@ -597,7 +610,10 @@ async function run () {
     run,
     analysis,
     debug,
+    test,
     contractVerification,
+    gitPanel,
+    solidityUml,
     filePanel.remixdHandle,
     filePanel.gitHandle
   ])
@@ -637,13 +653,19 @@ async function run () {
   await appManager.activatePlugin(['home'])
   await appManager.activatePlugin(['settings'])
   await appManager.activatePlugin(['hiddenPanel', 'pluginManager', 'filePanel', 'contextualListener', 'terminal', 'fetchAndCompile', 'contentImport'])
+  try {
+    await appManager.activatePlugin('gitPanel')
+  } catch (e) {
+    console.error('gitPanel activation failed:', e)
+  }
 
   // Set workspace after initial activation
   if (Array.isArray(workspace) && workspace.length > 0) {
     appManager.activatePlugin(workspace).then(async () => {
       try {
         if (params.deactivate) {
-          await appManager.deactivatePlugin(params.deactivate.split(','))
+          const pluginsToDeactivate = filterUrlPluginNames(params.deactivate)
+          await Promise.all(pluginsToDeactivate.map((name) => appManager.deactivatePlugin(name)))
         }
       } catch (e) {
         console.log(e)
@@ -653,11 +675,14 @@ async function run () {
       if (pluginLoader.current === 'queryParams' && workspace.length > 0) menuicons.select(workspace[workspace.length - 1])
 
       if (params.call) {
-        const callDetails = params.call.split('//')
-        if (callDetails.length > 1) {
+        const callDetails = parseUrlPluginCall(params.call)
+        if (callDetails) {
           toolTip(`initiating ${callDetails[0]} ...`)
           // @todo(remove the timeout when activatePlugin is on 0.3.0)
           appManager.call(...callDetails).catch(console.error)
+        } else {
+          console.warn('[urlParams] blocked unsafe plugin call')
+          toolTip('Blocked an unsafe action from the URL.')
         }
       }
     }).catch(console.error)
