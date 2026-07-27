@@ -1,12 +1,6 @@
 --- a/minimatch.js
 +++ b/minimatch.js
-@@ -7,7 +7,8 @@
- minimatch.sep = path.sep
- 
- var GLOBSTAR = minimatch.GLOBSTAR = Minimatch.GLOBSTAR = {}
+@@ -10 +10,2 @@
 -var expand = require('brace-expansion')
 +var braceExpansion = require('brace-expansion')
 +var expand = typeof braceExpansion === 'function' ? braceExpansion : braceExpansion.expand
- 
- var plTypes = {
-   '!': { open: '(?:(?!(?:', close: '))[^/]*?)'},
