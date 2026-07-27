@@ -41,7 +41,43 @@ Reports land in `playwright-report/` (gitignored under `reports/*`).
 | Spec | What it asserts |
 |---|---|
 | `home.spec.ts` | Landing page renders, primary Home actions are present, Advanced tools remain collapsed until expanded, the expanded advanced sections render, the state is persisted, the tabbar compile shortcut starts disabled without an active Solidity tab, and no console errors occur during initial load |
-| `github-token-modal.spec.ts` | "Connect token" opens the modal **without** the legacy "Remember in this browser" checkbox; the tab-only storage notice is present (regression for the 2026-05-27 HIGH finding) |
+| `github-token-modal.spec.ts` | "Connect token" opens the modal **without** the legacy "Remember in this browser" checkbox; the tab-only storage notice is present (regression guard for the token-persistence security fix) |
+| `solidity-uml-interactions.spec.ts` | UML diagram redraws on file switch, replays after rapid switches (dropped-redraw guard), survives a panel toggle-close/reopen, and Copy-Mermaid writes the source to the clipboard |
+| `solidity-lint-lifecycle.spec.ts` | Lint annotations clear when a finding is fixed, track the active file (no stale buffer), and stay responsive under rapid edits |
+| `git-panel-reactivity.spec.ts` | Unstage returns a file to Changes, A/M status badges render, and an in-editor save surfaces in the panel via the 500 ms reactive refresh (no re-open) |
+| `github-token-memory.spec.ts` | A reload drops the in-memory GitHub token and the UI re-reads disconnected; web storage is never written (memory-only token regression guard) |
+| `autosave-reactivity.spec.ts` | An idle edit autosaves (no Ctrl+S) and survives a full reload |
+
+## Deterministic gate subset (`@gate`)
+
+The v2.3.2 interaction-regression specs are tagged `@gate` and run
+deterministically — VM/local only, no network, wallet, or live clone. Specs
+that press Ctrl+S first abort every compiler source (remote binaries and the
+bundled same-origin fallback) via the `blockCompilerSources` helper: the save
+still happens (it runs before the compile), but no solc run ever starts, so the
+compile-saturation flake stays out of this subset by construction. Saves are
+then confirmed by polling the in-browser workspace FS (`readSavedFile`) instead
+of sleeping. Run just the gate subset with:
+
+```bash
+pnpm test:pw:gate      # playwright test --grep @gate
+```
+
+Unlike the full suite, this subset is meant to be **release-blocking**. The
+Playwright suite is `continue-on-error` / `allow_failure: true` in CI today
+because the full set carries network + compile-saturation flake; the `@gate`
+subset does not, so it can be promoted to a required check. Proposed CI change
+(Ops-owned — not wired here):
+
+- GitHub `ci.yml`: add a job running `pnpm test:pw:gate` **without**
+  `continue-on-error` (leave the existing `e2e-smoke` job informational).
+- Any other CI provider: the equivalent is a required (no allow-failure) job in
+  the test stage running `pnpm test:pw:gate`, keeping the full suite as a
+  separate informational job.
+
+To extend the gate, add `{ tag: '@gate' }` to any other deterministic spec.
+`autosave-reactivity.spec.ts` is intentionally **not** tagged — its idle-debounce
++ reload timing suits the smoke run, not a required gate.
 
 ## What it's NOT for
 

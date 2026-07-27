@@ -17,15 +17,13 @@
  * limitations under the License.
  */
 
-import React, { useState, useReducer, useEffect, useCallback } from 'react' // eslint-disable-line
-import { CopyToClipboard } from '@remix-ui/clipboard' // eslint-disable-line
+import React, { useState, useReducer, useEffect } from 'react' // eslint-disable-line
 
-import { enablePersonalModeText, ethereunVMText, generateContractMetadataText, gitAccessTokenLink, gitAccessTokenText, gitAccessTokenText2, gitAccessTokenTitle, matomoAnalytics, textDark, textSecondary, warnText, wordWrapText } from './constants'
+import { enablePersonalModeText, ethereunVMText, generateContractMetadataText, matomoAnalytics, textDark, textSecondary, warnText, wordWrapText } from './constants'
 
 import './remix-ui-settings.css'
-import { ethereumVM, generateContractMetadat, personal, textWrapEventAction, useMatomoAnalytics, saveTokenToast, removeTokenToast } from './settingsAction'
-import { initialState, toastInitialState, toastReducer, settingReducer } from './settingsReducer'
-import { Toaster } from '@remix-ui/toaster'// eslint-disable-line
+import { ethereumVM, generateContractMetadat, personal, textWrapEventAction, useMatomoAnalytics } from './settingsAction'
+import { initialState, settingReducer } from './settingsReducer'
 
 /* eslint-disable-next-line */
 export interface RemixUiSettingsProps {
@@ -37,21 +35,18 @@ export interface RemixUiSettingsProps {
 
 export const RemixUiSettings = (props: RemixUiSettingsProps) => {
   const [, dispatch] = useReducer(settingReducer, initialState)
-  const [state, dispatchToast] = useReducer(toastReducer, toastInitialState)
-  const [tokenValue, setTokenValue] = useState('')
   const [themeName, setThemeName] = useState('')
 
   useEffect(() => {
     props._deps.themeModule.switchTheme()
-    const token = props.config.get('settings/gist-access-token')
-    if (token === undefined) {
+    // First run: default contract-metadata generation to on. (This used to be
+    // keyed on the legacy Settings gist token being undefined; that PAT channel
+    // is retired, so the setting now keys off its own absence.)
+    if (props.config.get('settings/generate-contract-metadata') === undefined) {
       props.config.set('settings/generate-contract-metadata', true)
       dispatch({ type: 'contractMetadata', payload: { name: 'contractMetadata', isChecked: true, textClass: textDark } })
     }
-    if (token) {
-      setTokenValue(token)
-    }
-  }, [themeName, state.message])
+  }, [themeName])
 
   useEffect(() => {
     if (props.useMatomoAnalytics !== null) useMatomoAnalytics(props.config, props.useMatomoAnalytics, dispatch)
@@ -124,42 +119,6 @@ export const RemixUiSettings = (props: RemixUiSettingsProps) => {
     )
   }
 
-  const saveToken = () => {
-    saveTokenToast(props.config, dispatchToast, tokenValue)
-  }
-
-  const removeToken = () => {
-    setTokenValue('')
-    removeTokenToast(props.config, dispatchToast)
-  }
-
-  const handleSaveTokenState = useCallback(
-    (event) => {
-      setTokenValue(event.target.value)
-    },
-    [tokenValue]
-  )
-
-  const gistToken = () => (
-    <div className="border-top">
-      <div className="card-body pt-3 pb-2">
-        <h6 className="card-title">{ gitAccessTokenTitle }</h6>
-        <p className="mb-1">{ gitAccessTokenText }</p>
-        <p className="">{ gitAccessTokenText2 }</p>
-        <p className="mb-1"><a className="text-primary" target="_blank" rel="noopener noreferrer" href="https://github.com/settings/tokens">{ gitAccessTokenLink }</a></p>
-        <div className=""><label>TOKEN:</label>
-          <div className="text-secondary mb-0 h6">
-            <input id="gistaccesstoken" data-id="settingsTabGistAccessToken" type="password" className="form-control" onChange={handleSaveTokenState} value={ tokenValue } />
-            <div className="d-flex justify-content-end pt-2">
-              <CopyToClipboard content={tokenValue} data-id='copyToClipboardCopyIcon' />
-              <input className="btn btn-sm btn-primary ml-2" id="savegisttoken" data-id="settingsTabSaveGistToken" onClick={() => saveToken()} value="Save" type="button" disabled={tokenValue === ''}></input>
-              <button className="btn btn-sm btn-secondary ml-2" id="removegisttoken" data-id="settingsTabRemoveGistToken" title="Delete Github access token" onClick={() => removeToken()}>Remove</button>
-            </div>
-          </div></div>
-      </div>
-    </div>
-  )
-
   const themes = () => {
     const themes = props._deps.themeModule.getThemes()
     if (themes) {
@@ -175,7 +134,6 @@ export const RemixUiSettings = (props: RemixUiSettingsProps) => {
 
   return (
     <div>
-      {state.message ? <Toaster message= {state.message}/> : null}
       {generalConfig()}
       <div className="border-top">
         <div className="card-body pt-3 pb-2">
@@ -185,7 +143,6 @@ export const RemixUiSettings = (props: RemixUiSettingsProps) => {
           </div>
         </div>
       </div>
-      {gistToken()}
     </div>
   )
 }

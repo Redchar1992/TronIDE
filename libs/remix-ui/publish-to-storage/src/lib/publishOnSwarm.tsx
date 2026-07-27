@@ -17,9 +17,26 @@
  * limitations under the License.
  */
 
-import swarm from 'swarmgw'
+const SWARM_RAW_UPLOAD_URL = 'https://swarm-gateways.net/bzz-raw:/'
 
-const swarmgw = swarm()
+const putSwarmContent = async (content): Promise<string> => {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 30000)
+  try {
+    const response = await fetch(SWARM_RAW_UPLOAD_URL, {
+      method: 'POST',
+      body: content,
+      redirect: 'error',
+      signal: controller.signal
+    })
+    if (!response.ok) throw new Error(`Swarm upload failed with HTTP ${response.status}`)
+    const hash = await response.text()
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('Swarm gateway returned an invalid hash')
+    return hash
+  } finally {
+    clearTimeout(timeout)
+  }
+}
 
 export const publishToSwarm = async (contract, fileManager) => {
   // gather list of files to publish
@@ -114,15 +131,9 @@ export const publishToSwarm = async (contract, fileManager) => {
 }
 
 const swarmVerifiedPublish = async (content, expectedHash): Promise<Record<string, any>> => {
-  return new Promise((resolve, reject) => {
-    swarmgw.put(content, function (err, ret) {
-      if (err) {
-        reject(err)
-      } else if (expectedHash && ret !== expectedHash) {
-        resolve({ message: 'hash mismatch between solidity bytecode and uploaded content.', url: 'bzz-raw://' + ret, hash: ret })
-      } else {
-        resolve({ message: 'ok', url: 'bzz-raw://' + ret, hash: ret })
-      }
-    })
-  })
+  const ret = await putSwarmContent(content)
+  if (expectedHash && ret !== expectedHash) {
+    return { message: 'hash mismatch between solidity bytecode and uploaded content.', url: 'bzz-raw://' + ret, hash: ret }
+  }
+  return { message: 'ok', url: 'bzz-raw://' + ret, hash: ret }
 }

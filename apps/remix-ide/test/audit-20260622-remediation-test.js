@@ -93,19 +93,22 @@ test('frame-ancestors is a response-header-only directive (absent from <meta> fa
   t.end()
 })
 
-test('clickjacking / sniffing headers are sent by every response-header source', function (t) {
+test('clickjacking / sniffing / transport headers are sent by every response-header source', function (t) {
   var nginxConfig = readRoot('apps/remix-ide/nginx.conf')
   var buildSh = readRoot('build.sh')
   var webpackConfig = readRoot('apps/remix-ide/webpack.config.js')
 
   t.ok(/add_header X-Frame-Options "SAMEORIGIN" always/.test(nginxConfig), 'nginx sends X-Frame-Options: SAMEORIGIN')
   t.ok(/add_header X-Content-Type-Options "nosniff" always/.test(nginxConfig), 'nginx sends X-Content-Type-Options: nosniff')
+  t.ok(/add_header Strict-Transport-Security "max-age=31536000" always/.test(nginxConfig), 'nginx sends HSTS for one year')
 
   t.ok(/X-Frame-Options:\s*SAMEORIGIN/.test(buildSh), 'build.sh _headers sends X-Frame-Options: SAMEORIGIN')
   t.ok(/X-Content-Type-Options:\s*nosniff/.test(buildSh), 'build.sh _headers sends X-Content-Type-Options: nosniff')
+  t.ok(/Strict-Transport-Security:\s*max-age=31536000/.test(buildSh), 'build.sh _headers sends HSTS for one year')
 
   t.ok(/'X-Frame-Options':\s*'SAMEORIGIN'/.test(webpackConfig), 'dev-server sends X-Frame-Options: SAMEORIGIN')
   t.ok(/'X-Content-Type-Options':\s*'nosniff'/.test(webpackConfig), 'dev-server sends X-Content-Type-Options: nosniff')
+  t.ok(/'Strict-Transport-Security':\s*'max-age=31536000'/.test(webpackConfig), 'dev-server sends HSTS for one year')
 
   t.end()
 })

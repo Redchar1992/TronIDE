@@ -258,7 +258,13 @@ export class TxRunnerWeb3 {
     }
     const args = pass !== null ? [tx, pass, cb] : [tx, cb]
     try {
-      sendTx.apply({}, args)
+      const sent = sendTx.apply({}, args)
+      // web3's sendTransaction returns a PromiEvent that ALSO rejects when the
+      // receipt comes back reverted. The `cb` above already carries that
+      // outcome through the normal flow, so the returned promise's rejection is
+      // a duplicate — swallow it, otherwise every reverting VM write surfaces
+      // an uncaught "Transaction has been reverted by the EVM" page error.
+      if (sent && typeof sent.catch === 'function') sent.catch(() => {})
     } catch (e) {
       return callback(
         `Send transaction failed: ${e.message} . if you use an injected provider, please check it is properly unlocked. `

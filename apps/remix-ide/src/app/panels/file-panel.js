@@ -30,8 +30,19 @@ const { GitHandle } = require('../files/git-handle.js')
 const { SlitherHandle } = require('../files/slither-handle.js')
 const globalRegistry = require('../../global/registry')
 const examples = require('../editor/examples')
+const { searchWorkspaceFiles, collectSearchableFiles, DEFAULT_LIMITS: SEARCH_LIMITS, DEFAULT_EXCLUDE_PATTERN: SEARCH_EXCLUDE } = require('../search/workspace-search')
+const { workspace: remixLibWorkspace } = require('@remix-project/remix-lib')
+const getTronTemplate = (id) => {
+  try {
+    return remixLibWorkspace.tronTemplates.getTronTemplate(id)
+  } catch (e) {
+    return null
+  }
+}
 const GistHandler = require('../../lib/gist-handler')
 const QueryParams = require('../../lib/query-params')
+const { normalizeUrlImport } = require('../../lib/url-param-security')
+const lastWorkspace = require('../../lib/last-workspace')
 const modalDialogCustom = require('../ui/modal-dialog-custom')
 /*
   Overview of APIs:
@@ -53,7 +64,7 @@ const modalDialogCustom = require('../ui/modal-dialog-custom')
 const profile = {
   name: 'filePanel',
   displayName: 'File explorers',
-  methods: ['createNewFile', 'uploadFile', 'getCurrentWorkspace', 'getWorkspaces', 'createWorkspace', 'setWorkspace', 'registerContextMenuItem'],
+  methods: ['createNewFile', 'uploadFile', 'getCurrentWorkspace', 'getWorkspaces', 'createWorkspace', 'setWorkspace', 'registerContextMenuItem', 'getWorkspaceTemplates', 'aiSearchWorkspace'],
   events: ['setWorkspace', 'renameWorkspace', 'deleteWorkspace', 'createWorkspace'],
   icon: 'assets/img/fileManager.webp',
   description: ' - ',
@@ -146,6 +157,39 @@ module.exports = class Filepanel extends ViewPlugin {
     return await this.request.getCurrentWorkspace()
   }
 
+  // AI assistant: content search across the current workspace, reusing the
+  // Search panel's pure engine + shared collector. Read-only. options:
+  // { query, useRegex, matchCase, matchWholeWord, includePattern, excludePattern }.
+  // Defaults are AI-friendly: include '*' (every searchable text file, not just
+  // the panel's '*.sol, *.js') and the standard dot-dir exclude.
+  async aiSearchWorkspace (options = {}) {
+    const fileManager = this._deps.fileManager
+    const { files, skippedFiles, warnings } = await collectSearchableFiles(fileManager, SEARCH_LIMITS)
+    const result = searchWorkspaceFiles(files, {
+      query: String(options.query || ''),
+      includePattern: options.includePattern ? String(options.includePattern) : '*',
+      excludePattern: options.excludePattern ? String(options.excludePattern) : SEARCH_EXCLUDE,
+      matchCase: !!options.matchCase,
+      matchWholeWord: !!options.matchWholeWord,
+      useRegex: !!options.useRegex,
+      skippedFiles,
+      limits: SEARCH_LIMITS
+    })
+    if (warnings.length) result.warnings = warnings.concat(result.warnings || [])
+    return result
+  }
+
+  // The TRON starter templates a new workspace can be seeded from (id/name/
+  // description). Exposed so the AI assistant can offer them for create_workspace.
+  getWorkspaceTemplates () {
+    try {
+      const list = remixLibWorkspace && remixLibWorkspace.tronTemplates && remixLibWorkspace.tronTemplates.TRON_TEMPLATES
+      return (list || []).map((t) => ({ id: t.id, name: t.name, description: t.description }))
+    } catch (e) {
+      return []
+    }
+  }
+
   async getWorkspaces () {
     const result = new Promise((resolve, reject) => {
       const workspacesPath = this._deps.fileProviders.workspace.workspacesPath
@@ -186,21 +230,38 @@ module.exports = class Filepanel extends ViewPlugin {
 
     if (params.code || params.url) {
       try {
+        const safeImportUrl = params.url ? normalizeUrlImport(params.url) : null
+        if (params.url && !safeImportUrl) {
+          modalDialogCustom.alert(
+            'URL import blocked',
+            'For your security, URL deep links can only import source files from GitHub or GitHub Gist over HTTPS.'
+          )
+          return
+        }
         await this.processCreateWorkspace('code-sample')
-        this._deps.fileProviders.workspace.setWorkspace('code-sample')
+        const workspaceProvider = this._deps.fileProviders.workspace
+        workspaceProvider.setWorkspace('code-sample')
+        // A URL import can finish after the user has switched branches or
+        // workspaces. Bind both deep-link variants before that async resolve so
+        // the provider rejects the eventual write instead of targeting the new
+        // workspace implicitly.
+        const mutationContext = workspaceProvider.captureMutationContext()
+        const writeDeepLinkFile = (path, content) => new Promise((resolve, reject) => {
+          workspaceProvider.set(path, content, (error) => error ? reject(error) : resolve(true), mutationContext)
+        })
         let path = ''
         let content = ''
         if (params.code) {
           var hash = bufferToHex(keccakFromString(params.code))
           path = 'contract-' + hash.replace('0x', '').substring(0, 10) + '.sol'
           content = atob(params.code)
-          await this._deps.fileProviders.workspace.set(path, content)
+          await writeDeepLinkFile(path, content)
         }
-        if (params.url) {
-          const data = await this.call('contentImport', 'resolve', params.url)
+        if (safeImportUrl) {
+          const data = await this.call('contentImport', 'resolve', safeImportUrl)
           path = data.cleanUrl
           content = data.content
-          await this._deps.fileProviders.workspace.set(path, content)
+          await writeDeepLinkFile(path, content)
         }
         this.initialWorkspace = 'code-sample'
         await this._deps.fileManager.openFile(path)
@@ -223,8 +284,19 @@ module.exports = class Filepanel extends ViewPlugin {
           this._deps.fileProviders.browser.resolveDirectory('.workspaces', async (error, filesList) => {
             if (error) return reject(error)
             if (Object.keys(filesList).length > 0) {
-              const workspacePath = Object.keys(filesList)[0].split('/').filter(val => val)
-              const workspaceName = workspacePath[workspacePath.length - 1]
+              const available = Object.keys(filesList).map((path) => {
+                const parts = path.split('/').filter(val => val)
+                return parts[parts.length - 1]
+              })
+              // prefer the workspace the user last worked in (persisted by
+              // workspaceFileProvider.setWorkspace) over the arbitrary first
+              // directory entry — a restart used to land on the
+              // alphabetically-first workspace (typically default_workspace).
+              // lastWorkspace prefers THIS tab's own marker (sessionStorage)
+              // over the cross-tab localStorage fallback, so a reload cannot
+              // adopt whatever workspace another tab touched last.
+              const saved = lastWorkspace.get()
+              const workspaceName = (saved && available.includes(saved)) ? saved : available[0]
 
               this._deps.fileProviders.workspace.setWorkspace(workspaceName)
               return resolve(workspaceName)
@@ -244,16 +316,33 @@ module.exports = class Filepanel extends ViewPlugin {
     return await this.request.uploadFile(event)
   }
 
-  async processCreateWorkspace (name) {
-    const workspaceProvider = this._deps.fileProviders.workspace
-    const browserProvider = this._deps.fileProviders.browser
-    const workspacePath = 'browser/' + workspaceProvider.workspacesPath + '/' + name
-    const workspaceRootPath = 'browser/' + workspaceProvider.workspacesPath
-    const workspaceRootPathExists = await browserProvider.exists(workspaceRootPath)
-    const workspacePathExists = await browserProvider.exists(workspacePath)
+  _workspaceMutation (action, suppliedToken) {
+    if (suppliedToken !== undefined) {
+      this._deps.fileManager.assertWorkspaceMutationToken(suppliedToken)
+      return { token: suppliedToken, owned: false }
+    }
+    return { token: this._deps.fileManager.beginWorkspaceMutation(action), owned: true }
+  }
 
-    if (!workspaceRootPathExists) browserProvider.createDir(workspaceRootPath)
-    if (!workspacePathExists) browserProvider.createDir(workspacePath)
+  async processCreateWorkspace (name, mutationToken) {
+    const mutation = this._workspaceMutation('create workspaces', mutationToken)
+    try {
+      const workspaceProvider = this._deps.fileProviders.workspace
+      const browserProvider = this._deps.fileProviders.browser
+      const workspacePath = 'browser/' + workspaceProvider.workspacesPath + '/' + name
+      const workspaceRootPath = 'browser/' + workspaceProvider.workspacesPath
+      const workspaceRootPathExists = await browserProvider.exists(workspaceRootPath)
+      const workspacePathExists = await browserProvider.exists(workspacePath)
+
+      // Recheck after the async existence reads and immediately before the raw
+      // browser-provider mutations. The surrounding workspace lease also keeps
+      // Git checkout from starting until the whole create/switch flow completes.
+      this._deps.fileManager.assertWorkspaceMutationToken(mutation.token)
+      if (!workspaceRootPathExists) browserProvider.createDir(workspaceRootPath)
+      if (!workspacePathExists) browserProvider.createDir(workspacePath)
+    } finally {
+      if (mutation.owned) this._deps.fileManager.endWorkspaceMutation(mutation.token)
+    }
   }
 
   async workspaceExists (name) {
@@ -263,16 +352,25 @@ module.exports = class Filepanel extends ViewPlugin {
     return browserProvider.exists(workspacePath)
   }
 
-  async createWorkspace (workspaceName, setDefaults = true) {
-    if (!workspaceName) throw new Error('name cannot be empty')
-    if (checkSpecialChars(workspaceName) || checkSlash(workspaceName)) throw new Error('special characters are not allowed')
-    if (await this.workspaceExists(workspaceName)) throw new Error('workspace already exists')
-    else {
+  async createWorkspace (workspaceName, setDefaultsOrTemplateId = true, suppliedMutationToken) {
+    const mutation = this._workspaceMutation('create workspaces', suppliedMutationToken)
+    try {
+      if (!workspaceName) throw new Error('name cannot be empty')
+      if (checkSpecialChars(workspaceName) || checkSlash(workspaceName)) throw new Error('special characters are not allowed')
+      if (await this.workspaceExists(workspaceName)) throw new Error('workspace already exists')
       const workspaceProvider = this._deps.fileProviders.workspace
-      await this.processCreateWorkspace(workspaceName)
+      await this.processCreateWorkspace(workspaceName, mutation.token)
       workspaceProvider.setWorkspace(workspaceName)
-      await this.request.setWorkspace(workspaceName) // tells the react component to switch to that workspace
-      if (setDefaults) {
+      await this.request.setWorkspace(workspaceName, mutation.token) // tells the react component to switch to that workspace
+      // second arg keeps its historical boolean meaning (seed the default
+      // sample contracts); a string selects one of the TRON templates instead
+      const template = typeof setDefaultsOrTemplateId === 'string' ? getTronTemplate(setDefaultsOrTemplateId) : null
+      if (template) {
+        // seeding only — the caller opens the file after the UI has switched
+        // workspaces, or the switch would close the tab again
+        await workspaceProvider.set(template.path, template.content)
+      } else if (setDefaultsOrTemplateId === true || typeof setDefaultsOrTemplateId === 'string') {
+        // unknown template id falls back to the default seed rather than an empty workspace
         for (const file in examples) {
           try {
             await workspaceProvider.set(examples[file].name, examples[file].content)
@@ -281,30 +379,46 @@ module.exports = class Filepanel extends ViewPlugin {
           }
         }
       }
+    } finally {
+      if (mutation.owned) this._deps.fileManager.endWorkspaceMutation(mutation.token)
     }
   }
 
-  async renameWorkspace (oldName, workspaceName) {
-    if (!workspaceName) throw new Error('name cannot be empty')
-    if (checkSpecialChars(workspaceName) || checkSlash(workspaceName)) throw new Error('special characters are not allowed')
-    if (await this.workspaceExists(workspaceName)) throw new Error('workspace already exists')
-    const browserProvider = this._deps.fileProviders.browser
-    const workspacesPath = this._deps.fileProviders.workspace.workspacesPath
-    browserProvider.rename('browser/' + workspacesPath + '/' + oldName, 'browser/' + workspacesPath + '/' + workspaceName, true)
+  async renameWorkspace (oldName, workspaceName, suppliedMutationToken) {
+    const mutation = this._workspaceMutation('rename workspaces', suppliedMutationToken)
+    try {
+      if (!workspaceName) throw new Error('name cannot be empty')
+      if (checkSpecialChars(workspaceName) || checkSlash(workspaceName)) throw new Error('special characters are not allowed')
+      if (await this.workspaceExists(workspaceName)) throw new Error('workspace already exists')
+      this._deps.fileManager.assertWorkspaceMutationToken(mutation.token)
+      const browserProvider = this._deps.fileProviders.browser
+      const workspacesPath = this._deps.fileProviders.workspace.workspacesPath
+      browserProvider.rename('browser/' + workspacesPath + '/' + oldName, 'browser/' + workspacesPath + '/' + workspaceName, true)
+    } finally {
+      if (mutation.owned) this._deps.fileManager.endWorkspaceMutation(mutation.token)
+    }
   }
 
   /** these are called by the react component, action is already finished whent it's called */
-  async setWorkspace (workspace, setEvent = true, syncComponent = false) {
-    if (typeof workspace === 'string') workspace = { name: workspace, isLocalhost: false }
-    if (syncComponent && this.request.setWorkspace) return this.request.setWorkspace(workspace.name)
-    if (workspace.isLocalhost) {
-      this.call('manager', 'activatePlugin', 'remixd')
-    } else if (await this.call('manager', 'isActive', 'remixd')) {
-      this.call('manager', 'deactivatePlugin', 'remixd')
-    }
-    if (setEvent) {
-      this._deps.fileManager.setMode(workspace.isLocalhost ? 'localhost' : 'browser')
-      this.emit('setWorkspace', workspace)
+  async setWorkspace (workspace, setEvent = true, syncComponent = false, suppliedMutationToken) {
+    const mutation = this._workspaceMutation('switch workspaces', suppliedMutationToken)
+    try {
+      if (typeof workspace === 'string') workspace = { name: workspace, isLocalhost: false }
+      if (syncComponent && this.request.setWorkspace) return await this.request.setWorkspace(workspace.name, mutation.token)
+      if (workspace.isLocalhost) {
+        await this.call('manager', 'activatePlugin', 'remixd')
+      } else if (this._deps.fileProviders.localhost.isConnected() && await this.call('manager', 'isActive', 'remixd')) {
+      // Wait for the disconnect event to settle before publishing the browser
+      // workspace. The Workspace component has already recorded the user's
+      // destination, so the event only hides the localhost tree.
+        await this.call('manager', 'deactivatePlugin', 'remixd')
+      }
+      if (setEvent) {
+        this._deps.fileManager.setMode(workspace.isLocalhost ? 'localhost' : 'browser')
+        this.emit('setWorkspace', workspace)
+      }
+    } finally {
+      if (mutation.owned) this._deps.fileManager.endWorkspaceMutation(mutation.token)
     }
   }
 

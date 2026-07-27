@@ -346,6 +346,24 @@
           background-color: rgba(145, 151, 157, 0.3);
           cursor: not-allowed;
         }
+        // While the AI is working, the send button becomes a red Stop button.
+        // This MUST live in the SCSS source: index.css is a `sass src:src` build
+        // artifact, so a .css-only edit is silently wiped on the next compile
+        // (this class was lost that way repeatedly). Pinned by TC-AI-020.
+        &.ai-busy-stop{
+          background-color: #c0392b;
+          cursor: pointer;
+          &:hover{
+            background-color: #d84a3b;
+          }
+        }
+        .ai-stop-glyph{
+          display: inline-block;
+          width: 12px;
+          height: 12px;
+          border-radius: 2px;
+          background: #fff;
+        }
       }
       &.textarea-disabled{
         cursor: not-allowed;

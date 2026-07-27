@@ -16,7 +16,7 @@ test.describe('Wallet without injected provider', () => {
     // The prompt is a toast, not inline button text; the button stays compact.
     await expect(page.locator('.ant-message')).toContainText('TronLink is not installed', { timeout: 10_000 })
     await expect(headerBtn).toContainText('Connect Wallet')
-    await expect(headerBtn).not.toContainText(/Wallet T\w/)
+    await expect(headerBtn).not.toHaveAttribute('aria-haspopup', 'menu')
 
     // No connected-wallet menu, no account leaked into Deploy & Run.
     await expect(page.locator('[data-id="headerWalletMenu"]')).toHaveCount(0)

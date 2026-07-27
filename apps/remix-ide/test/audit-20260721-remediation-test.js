@@ -1,0 +1,42 @@
+/*
+ * Static regression pins for the 2026-07-21 v2.3.2 security assessment.
+ */
+
+'use strict'
+
+var fs = require('fs')
+var path = require('path')
+var test = require('tape')
+var root = path.join(__dirname, '..', '..', '..')
+
+function read (relativePath) {
+  return fs.readFileSync(path.join(root, relativePath), 'utf8')
+}
+
+test('URL fragments cannot dispatch arbitrary native plugin operations', function (t) {
+  var app = read('apps/remix-ide/src/app.js')
+  var manager = read('apps/remix-ide/src/remixAppManager.js')
+  var security = read('apps/remix-ide/src/lib/url-param-security.js')
+
+  t.ok(app.indexOf('parseUrlPluginCall(params.call)') !== -1, 'app routes #call through the strict parser')
+  t.equal(app.indexOf("params.call.split('//')"), -1, 'app no longer expands arbitrary URL arguments into appManager.call')
+  t.ok(security.indexOf("fileManager: new Set(['open'])") !== -1, 'only the non-mutating open-file deep link remains')
+  t.ok(manager.indexOf('return filterUrlPluginNames(activate)') !== -1, '#activate is filtered through a fixed panel allowlist')
+  t.equal(manager.indexOf("['ethdoc'].includes(from.name)"), -1, 'the ethdoc activation bypass is removed')
+  t.ok(manager.indexOf('if (await this.canDeactivatePlugin(from, to))') !== -1, 'async deactivation authorization is awaited')
+  t.end()
+})
+
+test('URL imports, wallet events, OAuth messages, and AI staging keep their security gates', function (t) {
+  var filePanel = read('apps/remix-ide/src/app/panels/file-panel.js')
+  var wallet = read('libs/remix-ui/top-header/src/lib/top-header.js')
+  var oauth = read('apps/remix-ide/src/lib/github-oauth.js')
+  var chat = read('libs/remix-code-reader/src/components/Chat/index.js')
+
+  t.ok(filePanel.indexOf('normalizeUrlImport(params.url)') !== -1, '#url is allow-listed before contentImport.resolve')
+  t.ok(wallet.indexOf('event.source !== window || event.origin !== window.location.origin') !== -1, 'wallet postMessage requires the same window and origin')
+  t.ok(oauth.indexOf('event.source !== popup') !== -1, 'OAuth completion must come from the popup that was opened')
+  t.ok(chat.indexOf("title: 'AI wants to stage all workspace changes'") !== -1, 'git_stage_all asks for confirmation')
+  t.ok(chat.indexOf("title: 'AI wants to stage workspace files'") !== -1, 'git_stage asks for confirmation')
+  t.end()
+})

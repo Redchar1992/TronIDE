@@ -44,16 +44,10 @@ interface HandlerResponse {
 
 export class RemixURLResolver {
   private previouslyHandled: PreviouslyHandledImports
-  gistAccessToken: string
   protocol: string
 
-  constructor (gistToken?: string, protocol = 'http:') {
+  constructor (protocol = 'http:') {
     this.previouslyHandled = {}
-    this.setGistToken(gistToken, protocol)
-  }
-
-  async setGistToken (gistToken?: string, protocol = 'http:') {
-    this.gistAccessToken = gistToken || ''
     this.protocol = protocol
   }
 

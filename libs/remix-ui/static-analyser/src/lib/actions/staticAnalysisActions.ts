@@ -25,7 +25,10 @@ export const compilation = (analysisModule, dispatch) => {
       'solidity',
       'compilationFinished',
       (file, source, languageVersion, data) => {
-        if (languageVersion.indexOf('soljson') !== 0) return
+        // languageVersion is the real solc version now (was the literal
+        // 'soljson') — a positive 'soljson' test would drop every compilation
+        // and leave the analyzer reporting "no compilation" forever.
+        if (!languageVersion || languageVersion.indexOf('vyper') === 0) return
         dispatch({ type: 'compilationFinished', payload: { file, source, languageVersion, data } })
       }
     )

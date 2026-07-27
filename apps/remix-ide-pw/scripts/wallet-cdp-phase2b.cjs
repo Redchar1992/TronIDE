@@ -77,7 +77,7 @@ async function clickInPopup (browser, namePattern, timeoutMs) {
       const ok = await clickInPopup(browser, /^(连接|Connect)$/, 15000)
       check('approve connect', ok, 'clicked Connect')
     }
-    await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 30000 })
+    await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 30000 })
     log('connected')
     await page.locator('#runTabView select[class^="contractNames"]').selectOption('Storage')
 

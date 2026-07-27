@@ -50,7 +50,7 @@ async function tapInPopup (browser, label, timeoutMs) {
     await page.locator('*[data-id="compilerContainerCompileBtn"]').click()
     await page.locator('*[data-id="compiledContracts"]').waitFor({ timeout: 30000 })
     await page.locator('[data-id="headerWalletConnect"]').click()
-    await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 90000 })
+    await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 90000 })
     await page.locator('#runTabView select[class^="contractNames"]').selectOption('Storage')
 
     const journalBefore = ((await page.locator('#journal').textContent().catch(() => '')) || '').length

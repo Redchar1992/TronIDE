@@ -112,12 +112,11 @@ module.exports = {
       .modalFooterOKClick()
   },
 
-  'Display Error Message For Missing Gist Token When Publishing': function (browser: NightwatchBrowser) {
+  // The Settings gist-token panel is retired: with no in-memory GitHub
+  // connection, publishing must point the user at the Connect GitHub flow.
+  'Display Error Message For Missing GitHub Connection When Publishing': function (browser: NightwatchBrowser) {
     browser
       .waitForElementVisible('*[data-id="remixIdeIconPanel"]', 10000)
-      .clickLaunchIcon('settings')
-      .waitForElementVisible('[data-id="settingsTabRemoveGistToken"]')
-      .click('[data-id="settingsTabRemoveGistToken"]')
       .clickLaunchIcon('filePanel')
       .waitForElementVisible('*[data-id="fileExplorerNewFilepublishToGist"]')
       .click('*[data-id="fileExplorerNewFilepublishToGist"]')
@@ -126,7 +125,7 @@ module.exports = {
       .click('*[data-id="default_workspaceModalDialogContainer-react"] .modal-ok')
       .pause(10000)
       .getText('[data-id="default_workspaceModalDialogModalBody-react"]', (result) => {
-        browser.assert.ok(result.value === 'TronIDE requires an access token (which includes gists creation permission). Please go to the settings tab to create one.', 'Assert failed. Gist token error message not displayed.')
+        browser.assert.ok(result.value === 'Publishing a gist needs a GitHub connection that can create gists. Use "Connect GitHub" on the Home page (or the header button) to sign in, then publish again.', 'Assert failed. Gist connect-GitHub error message not displayed.')
       })
       .click('[data-id="default_workspace-modal-footer-ok-react"]')
   },
@@ -134,10 +133,7 @@ module.exports = {
   'Import From Gist For Valid Gist ID': function (browser: NightwatchBrowser) {
     browser
       .waitForElementVisible('*[data-id="remixIdeIconPanel"]', 10000)
-      .clickLaunchIcon('settings')
-      .click('*[data-id="settingsTabGenerateContractMetadataLabel"]')
-      .setValue('[data-id="settingsTabGistAccessToken"]', process.env.gist_token)
-      .click('[data-id="settingsTabSaveGistToken"]')
+      // Public gists load anonymously — the Settings gist-token panel is retired.
       .clickLaunchIcon('filePanel')
       .scrollAndClick('*[data-id="landingPageImportFromGistButton"]')
       .waitForElementVisible('*[data-id="modalDialogCustomPromptText"]')

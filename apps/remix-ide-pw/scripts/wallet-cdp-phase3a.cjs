@@ -65,7 +65,7 @@ async function tapInPopup (browser, label, timeoutMs) {
     // Connect — the user clicks the re-auth popup if one shows (90s budget).
     log('connecting… (if a TronLink popup appears, the USER approves this one)')
     await page.locator('[data-id="headerWalletConnect"]').click()
-    await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 90000 })
+    await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 90000 })
     log('connected')
     await page.locator('#runTabView select[class^="contractNames"]').selectOption('Storage')
 

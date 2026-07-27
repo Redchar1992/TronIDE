@@ -3,8 +3,12 @@
   display: block;
   position: fixed;
   border-radius: 2px;
-  z-index: 1000;
+  /* Above the 1030/1040 top header, but below Bootstrap modals (1050). */
+  z-index: 1045;
   box-shadow: 0 0 4px var(--dark);
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
 }
 .remixui_contextContainer:focus {
     outline: none;

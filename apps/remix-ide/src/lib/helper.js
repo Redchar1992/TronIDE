@@ -17,7 +17,6 @@
  * limitations under the License.
  */
 
-var async = require('async')
 const ethJSUtil = require('@tvmjs/util')
 const { keccak256 } = require('js-sha3')
 const remixLib = require('@remix-project/remix-lib')
@@ -54,20 +53,15 @@ module.exports = {
       name = split[1]
       ext = split[2]
     }
-    var exist = true
-    async.whilst(
-      () => { return exist },
-      (callback) => {
-        fileProvider.exists(name + counter + prefix + '.' + ext).then(currentExist => {
-          exist = currentExist
-          if (exist) counter = (counter | 0) + 1
-          callback()
-        }).catch(error => {
-          if (error) console.log(error)
-        })
-      },
-      (error) => { cb(error, name + counter + prefix + '.' + ext) }
-    )
+    const candidate = () => name + counter + prefix + '.' + ext
+    const findAvailableName = async () => {
+      while (await fileProvider.exists(candidate())) counter = (counter | 0) + 1
+      return candidate()
+    }
+
+    findAvailableName()
+      .then((availableName) => cb(null, availableName))
+      .catch((error) => cb(error, candidate()))
   },
   createNonClashingName (name, fileProvider, cb) {
     this.createNonClashingNameWithPrefix(name, fileProvider, '', cb)

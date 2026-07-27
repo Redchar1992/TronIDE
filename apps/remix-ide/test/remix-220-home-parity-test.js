@@ -81,8 +81,8 @@ test('Remix 2.2.0 home parity records edge, security, accessibility, and blocked
   var landingSource = fs.readFileSync(landingSourcePath, 'utf8')
   var contractVerificationSource = fs.readFileSync(contractVerificationSourcePath, 'utf8')
 
-  t.ok(landingSource.indexOf('OAuth write flows remain out of scope for this MVP.') !== -1 && landingSource.indexOf('fine-grained GitHub token') !== -1, 'GitHub OAuth and token-mode boundaries are explicit')
-  t.ok(landingSource.indexOf('Default storage is session-only') !== -1 && landingSource.indexOf('remember mode stores the token in this browser') !== -1, 'account auth is documented as token-only instead of mocked')
+  t.ok(landingSource.indexOf('connectWithGithubOAuth') !== -1 && landingSource.indexOf('fine-grained GitHub token') !== -1, 'GitHub OAuth and token-mode boundaries are explicit')
+  t.ok(landingSource.indexOf('The token stays in this tab, survives refresh') !== -1 && landingSource.indexOf('never written to persistent browser storage') !== -1, 'account auth documents tab-scoped credential storage instead of a nonexistent remember mode')
   t.equal(landingSource.indexOf('landingAiAudioButton'), -1, 'Home no longer exposes an AI audio placeholder hook')
   t.equal(landingSource.indexOf('landingAiModelSelector'), -1, 'Home no longer exposes an AI model selector placeholder hook')
   t.equal(landingSource.indexOf('landingAiHistoryButton'), -1, 'Home no longer exposes an AI history placeholder hook')
@@ -95,7 +95,7 @@ test('Remix 2.2.0 home parity records edge, security, accessibility, and blocked
   t.ok(contractVerificationSource.indexOf('Sourcify, Etherscan, Blockscout, and Routescan are EVM services') !== -1, 'unsupported EVM verification providers are not advertised as TRON backends')
   t.ok(contractVerificationSource.indexOf('TronScan source submission remains a manual external step') !== -1, 'TronScan source submission boundary is explicit')
   t.equal(landingSource.indexOf('Blocked'), -1, 'Home does not expose blocked status labels to users')
-  t.ok(landingSource.indexOf('TRON Contract Verification') !== -1 && landingSource.indexOf('TVM Solidity Analyzers') !== -1 && landingSource.indexOf('TRON Cookbook') !== -1, 'Most used plugin cards use TRON-specific labels')
+  t.ok(landingSource.indexOf('TRON Contract Verification') !== -1 && landingSource.indexOf('TVM Solidity Analyzers') !== -1 && landingSource.indexOf('New TRON Workspace') !== -1, 'Most used plugin cards use TRON-specific labels')
   t.equal(landingSource.indexOf('TRON Tutorials'), -1, 'Home hides tutorial walkthrough plugin card')
   t.equal(landingSource.indexOf('LearnEth Tutorials'), -1, 'Home no longer exposes LearnEth plugin copy')
   t.equal(landingSource.indexOf('multiple services at the same time'), -1, 'Home no longer exposes EVM multi-service verification copy')
@@ -121,10 +121,12 @@ test('TronIDE contract verification MVP packages compilation data and queries Tr
     'standardJsonInput',
     'contractVerificationNetworkSelect',
     'contractVerificationAddressInput',
+    'contractVerificationContractSelect',
     'contractVerificationCheckStatus',
     'contractVerificationGeneratePackage',
     'contractVerificationCopyPackage',
     'contractVerificationDownloadPackage',
+    'contractVerificationDownloadFlatten',
     'contractVerificationOpenTronScan',
     'contractVerificationStatusResult',
     'contractVerificationPackageChecklist',
@@ -174,8 +176,6 @@ test('Remix 2.2.0 home parity constrains user input, logs, performance, and resp
     return /token|secret|password|private|credential|api/i.test(statement)
   })
 
-  var generatedWorkspacePrefix = 'workspaceName = `tron_workspace_' + '$' + '{Date.now()}`'
-
   t.equal(landingSource.indexOf('${renderWalkthroughsPanel()}'), -1, 'walkthroughs are hidden from the Home advanced tools layout')
   t.equal(landingSource.indexOf('landingStartLearningButton'), -1, 'Start Learning entry is hidden while walkthroughs are disabled')
   t.ok(landingSource.indexOf('connectWalletFromHome') !== -1 && landingSource.indexOf('[data-id="headerWalletConnect"]') !== -1, 'Home wallet entry delegates to the real header wallet action')
@@ -194,7 +194,7 @@ test('Remix 2.2.0 home parity constrains user input, logs, performance, and resp
   t.ok(landingSource.indexOf('isElementCollapsed(side)') !== -1 && landingSource.indexOf('isElementCollapsed(terminalPanel)') !== -1 && landingSource.indexOf('isElementCollapsed(ai)') !== -1, 'layout reset checks side, terminal, and AI panel visibility before restoring')
   t.ok(landingSource.indexOf('landingRecipeTronLink') !== -1 && landingSource.indexOf('checkTronLinkReadiness') !== -1, 'TronLink readiness checker is available without backend support')
   t.ok(landingSource.indexOf('landingCookbookPanel') !== -1 && landingSource.indexOf('landingRecipeGithubToken') !== -1, 'static TRON cookbook recipes are available locally')
-  t.ok(landingSource.indexOf(generatedWorkspacePrefix) !== -1, 'workspace creation uses generated names instead of accepting raw user input')
+  t.ok(landingSource.indexOf("document.querySelector('[data-id=\"workspaceCreate\"]')") !== -1, 'Home workspace creation opens the File Explorer Create Workspace dialog (which validates the name and offers templates)')
   t.deepEqual(leakingConsoleStatements, [], 'home parity console diagnostics do not include secret-bearing fields')
   t.ok(landingSource.indexOf('window.setTimeout') !== -1 && landingSource.indexOf('120)') !== -1, 'workspace refresh is debounced before file/workspace event processing')
   t.ok(landingSource.indexOf('countWorkspaceFiles') !== -1 && landingSource.indexOf('resolveDirectory') !== -1, 'workspace file counting is isolated to the existing workspace provider traversal')
@@ -203,7 +203,8 @@ test('Remix 2.2.0 home parity constrains user input, logs, performance, and resp
   t.ok(cssSource.indexOf('grid-template-columns: minmax(0, 1fr);') !== -1, 'desktop layout keeps the default Home content focused in a single column')
   t.equal(landingSource.indexOf('const renderTopProductBar'), -1, 'landing page no longer renders a duplicate product header')
   t.ok(topHeaderSource.indexOf("data-id='headerGithubConnect'") !== -1 && topHeaderSource.indexOf('connectGithub') !== -1 && topHeaderSource.indexOf('landingGithubTokenPanel') !== -1, 'real header GitHub action opens the token connection flow')
-  t.ok(topHeaderSource.indexOf('landingAdvancedToolsToggle') !== -1 && topHeaderSource.indexOf('landingGithubTokenConnect') !== -1, 'header GitHub action expands advanced tools before token flow')
+  t.ok(topHeaderSource.indexOf('landingAdvancedToolsToggle') !== -1 && topHeaderSource.indexOf('landingAdvancedToolsContent') !== -1, 'header GitHub action expands advanced tools before opening the token panel')
+  t.ok(topHeaderSource.indexOf('landingGithubOAuthConnect') !== -1 && landingSource.indexOf('data-id="landingGithubOAuthConnect"') !== -1, 'header GitHub action clicks a connect control that actually exists on the landing page')
   t.ok(topHeaderSource.indexOf("data-id='headerWalletConnect'") !== -1 && topHeaderSource.indexOf('connectWallet') !== -1, 'real header wallet action invokes the wallet connection flow')
   t.ok(topHeaderSource.indexOf("data-id='headerLayoutToggles'") !== -1 && topHeaderSource.indexOf("data-id='headerToggleSidePanel'") !== -1 && topHeaderSource.indexOf("data-id='headerToggleBottomPanel'") !== -1 && topHeaderSource.indexOf("data-id='headerToggleAiPanel'") !== -1, 'real header exposes side, bottom, and AI panel layout toggles')
   t.ok(topHeaderSource.indexOf("data-id='headerWorkspaceMenu'") !== -1 && topHeaderSource.indexOf("data-id='headerCreateWorkspace'") !== -1 && topHeaderSource.indexOf("data-id='headerBackupWorkspace'") !== -1 && topHeaderSource.indexOf("data-id='headerRestoreWorkspace'") !== -1 && topHeaderSource.indexOf("data-id='headerConnectLocalhost'") !== -1, 'real header exposes workspace create, backup, restore, and localhost actions')
@@ -212,7 +213,7 @@ test('Remix 2.2.0 home parity constrains user input, logs, performance, and resp
   t.ok(topHeaderSource.indexOf('toggleSidePanel') !== -1 && topHeaderSource.indexOf("document.getElementById('side-panel')") !== -1, 'side panel header toggle targets the real side panel')
   t.ok(topHeaderSource.indexOf('toggleBottomPanel') !== -1 && topHeaderSource.indexOf('mainview.minimizeTerminal') !== -1 && appSource.indexOf('new HeaderPanel(appManager, mainview)') !== -1, 'bottom panel header toggle uses the real mainview terminal control')
   t.ok(topHeaderSource.indexOf('toggleAiPanel') !== -1 && topHeaderSource.indexOf("plugin.call('aiPanel', 'hide')") !== -1, 'AI panel header toggle uses the existing AI panel show/hide method')
-  t.ok(topHeaderSource.indexOf("data-id='headerSettingsButton'") !== -1 && topHeaderSource.indexOf('settingsHandler') !== -1, 'settings entry is rendered as a real header action')
+  t.equal(topHeaderSource.indexOf("data-id='headerSettingsButton'"), -1, 'duplicate Settings entry is not rendered in the header')
   t.equal(topHeaderSource.indexOf('theme-wrapper'), -1, 'theme selector is removed from the header and remains available through Settings')
   t.ok(settingsSource.indexOf('data-id="settingsTabThemePanel"') !== -1 && settingsSource.indexOf('settingsTabTheme') !== -1 && settingsSource.indexOf('switchTheme') !== -1, 'Settings exposes the theme selector after it is removed from the header')
   t.ok(topHeaderStyle.indexOf('.header-layout-toggles') !== -1 && topHeaderStyle.indexOf('.layout-toggle-btn') !== -1, 'header layout toggles have compact centered styles')
@@ -226,10 +227,11 @@ test('Remix 2.2.0 home parity constrains user input, logs, performance, and resp
   t.ok(topHeaderSource.indexOf("data-id='headerWalletDisconnect'") !== -1 && topHeaderSource.indexOf('disconnectInjectedTronWeb') !== -1, 'wallet menu exposes an explicit disconnect flow')
   var disabledWalletButton = 'disabled={' + 'walletConnectInFlight}'
   t.ok(topHeaderSource.indexOf('walletConnectInFlight') !== -1 && topHeaderSource.indexOf(disabledWalletButton) !== -1, 'wallet connection guards against duplicate clicks while a request is pending')
-  t.ok(topHeaderSource.indexOf('TronLink is not installed') !== -1 && topHeaderSource.indexOf('Wallet connection was rejected') !== -1, 'wallet missing and rejected paths have clear user-facing feedback')
+  t.ok(topHeaderSource.indexOf('TronLink is not available in this browser') !== -1 && topHeaderSource.indexOf("TronLink didn't connect") !== -1 && topHeaderSource.indexOf('WALLET_CONNECTION_REJECTED:') !== -1, 'wallet missing and rejected paths have clear user-facing feedback (actual copy pinned, not just the constant name)')
   t.ok(topHeaderStyle.indexOf('.header-actions') !== -1 && topHeaderStyle.indexOf('.header-action-btn') !== -1, 'real header owns compact GitHub and wallet actions')
   t.ok(appSource.indexOf('style="min-width: 340px;"') !== -1 && aiPanelSource.indexOf("'340px'") !== -1, 'AI panel defaults visible and restores to reduced width')
-  t.equal(versionJson.version, '2.3.0', 'header version asset matches package release version')
+  var packageVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '../../../package.json'), 'utf8')).version
+  t.equal(versionJson.version, packageVersion, 'header version asset matches package release version')
   t.ok(cssSource.indexOf('grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));') !== -1, 'quick actions use auto-fit columns to avoid narrow cards')
   t.ok(cssSource.indexOf('grid-template-columns: 1fr;') !== -1, 'multi-column panels collapse to one column on narrower screens')
   t.end()
@@ -348,7 +350,7 @@ test('TronIDE v2.3.0 roadmap section 3 traceability maps every short-term item a
   t.end()
 })
 
-test('TronIDE v2.3.0 README states TRON scope, Nile validation, and external boundaries', function (t) {
+test('TronIDE v2.3.2 README states TRON scope, Nile validation, and external boundaries', function (t) {
   var readmeSource = fs.readFileSync(rootReadmePath, 'utf8')
   var requiredReadmeCopy = [
     'TRON-oriented fork of the Remix Project',
@@ -356,10 +358,10 @@ test('TronIDE v2.3.0 README states TRON scope, Nile validation, and external bou
     'install TronLink in your browser, unlock it, and switch to Nile',
     'Mainnet is not required for release validation',
     'Use Nile/testnet for validation; do not treat mainnet deployment as a release pass criterion',
-    'apps/remix-ide/docs/v2.3.0-roadmap-section-3-traceability.md',
-    'the TronScan-oriented Contract Verification plugin exposes its actual local state',
-    'GitHub OAuth is deferred while private read/write uses user-provided fine-grained tokens in the browser',
-    'automated TronScan source submission/receipts plus EVM-only verification services remain blocked/unavailable or not applicable to TRON rather than marked done'
+    '### v2.3.2 scope notes',
+    'GitHub connect via an OAuth popup',
+    'Contract Verification',
+    'Automated TronScan source submission/receipts and EVM-only verification services are unavailable or not applicable to TRON rather than marked as done'
   ]
   var missingReadmeCopy = requiredReadmeCopy.filter(function (item) {
     return readmeSource.indexOf(item) === -1
@@ -420,10 +422,9 @@ test('Remix 2.2.0 home parity source exposes user feedback and blocked states', 
   var topHeaderSource = fs.readFileSync(topHeaderSourcePath, 'utf8')
   var combinedSource = landingSource + '\n' + contractVerificationSource + '\n' + topHeaderSource
   var requiredFeedback = [
-    'Workspace created:',
     'TronScan status query',
-    'Package checklist',
-    'Generate package',
+    'flattened-source checklist',
+    'Download flattened .sol',
     'No notifications yet.'
   ]
   var missingFeedback = requiredFeedback.filter(function (item) {

@@ -36,10 +36,22 @@ import {
 /*
   trigger compilationFinished, compilerLoaded, compilationStarted, compilationDuration
 */
+
+// Watchdog for loading a compiler binary. Solc builds are large (9–26 MB) and
+// must DOWNLOAD, then PARSE + EXECUTE before window.Module is ready, so on a
+// slower connection a good load easily needs 30–60s. The old 30s cut good
+// loads short — every version switch would time out mid-download and fall back
+// to the builtin, so the version selector looked "stuck". Keep a bound (a
+// genuinely dead load must still fail), but a generous one.
+const COMPILER_LOAD_TIMEOUT_MS = 120000
+
 export class Compiler {
   event
   state: CompilerState
   workerHandler: EsWebWorkerHandlerInterface
+  // watchdog timers of the in-flight load; a stale one firing after a newer
+  // loadVersion() would terminate the new worker and misreport the old URL
+  private pendingLoadHandles: number[] = []
 
   constructor (public handleImportCall?: (fileurl: string, cb) => void) {
     this.event = new EventManager()
@@ -128,10 +140,10 @@ export class Compiler {
     this.event.trigger('compilerLoaded', [version])
   }
 
-  onCompilerLoadFailed (message: string): void {
+  onCompilerLoadFailed (message: string, url?: string): void {
     this.state.lastCompilationResult = null
     this.event.trigger('compilationFinished', [false, { error: { formattedMessage: message, severity: 'error' } }, {}])
-    this.event.trigger('compilerLoadFailed', [message])
+    this.event.trigger('compilerLoadFailed', [message, url])
   }
 
   /**
@@ -243,9 +255,17 @@ export class Compiler {
    */
 
   async loadVersion (usingWorker: boolean, url: string): Promise<void> {
-    url = assertAllowedCompilerURL(url)
+    try {
+      url = assertAllowedCompilerURL(url)
+    } catch (e) {
+      // surface through the standard failure path (panel error + event)
+      // instead of an unhandled promise rejection nothing listens to
+      this.onCompilerLoadFailed(e && e.message ? e.message : String(e), url)
+      return
+    }
     console.log('Loading ' + url + ' ' + (usingWorker ? 'with worker' : 'without worker'))
     this.event.trigger('loadingCompiler', [url, usingWorker])
+    this.clearPendingLoadHandles()
     if (this.state.worker) {
       this.state.worker.terminate()
       this.state.worker = null
@@ -264,6 +284,12 @@ export class Compiler {
     } else {
       this.loadInternal(url)
     }
+  }
+
+  private clearPendingLoadHandles (): void {
+    // clearTimeout also clears interval handles (they share one namespace)
+    for (const handle of this.pendingLoadHandles) window.clearTimeout(handle)
+    this.pendingLoadHandles = []
   }
 
   /**
@@ -294,12 +320,13 @@ export class Compiler {
     }, 200)
     loadTimeout = window.setTimeout(() => {
       window.clearInterval(check)
-      this.onCompilerLoadFailed(`Compiler load timed out after 30s: ${url}`)
-    }, 30000)
+      this.onCompilerLoadFailed(`Compiler load timed out after ${Math.round(COMPILER_LOAD_TIMEOUT_MS / 1000)}s: ${url}`, url)
+    }, COMPILER_LOAD_TIMEOUT_MS)
+    this.pendingLoadHandles.push(check, loadTimeout)
     newScript.onerror = () => {
       window.clearInterval(check)
       window.clearTimeout(loadTimeout)
-      this.onCompilerLoadFailed(`Failed to load compiler from ${url}`)
+      this.onCompilerLoadFailed(`Failed to load compiler from ${url}`, url)
     }
     document.getElementsByTagName('head')[0].appendChild(newScript)
   }
@@ -350,7 +377,7 @@ export class Compiler {
       event.preventDefault()
       window.clearTimeout(loadTimeout)
       const detail = event.message || event.error?.message || event.filename || 'unknown error'
-      this.onCompilerLoadFailed('Worker error: ' + detail)
+      this.onCompilerLoadFailed('Worker error: ' + detail, url)
     })
 
     this.state.compileJSON = (source: SourceWithTarget) => {
@@ -374,8 +401,9 @@ export class Compiler {
         this.state.worker.terminate()
         this.state.worker = null
       }
-      this.onCompilerLoadFailed(`Worker compiler load timed out after 30s: ${url}`)
-    }, 30000)
+      this.onCompilerLoadFailed(`Worker compiler load timed out after ${Math.round(COMPILER_LOAD_TIMEOUT_MS / 1000)}s: ${url}`, url)
+    }, COMPILER_LOAD_TIMEOUT_MS)
+    this.pendingLoadHandles.push(loadTimeout)
   }
 
   /**

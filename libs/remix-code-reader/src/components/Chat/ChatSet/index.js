@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import React, { useState ,useRef} from 'react'
+import React, { useState ,useRef, useEffect} from 'react'
 import './index.css'
 import IconComponent from '../../common/IconComponent'
 import { Input, Select ,Checkbox} from 'antd'
@@ -52,6 +52,9 @@ const aiModelVendor={
     },{
       value:'claude-opus-4-7',
       label:'Claude Opus 4.7',
+    },{
+      value:'claude-sonnet-5',
+      label:'Claude Sonnet 5',
     },{
       value:'claude-sonnet-4-6',
       label:'Claude Sonnet 4.6',
@@ -175,6 +178,7 @@ export const aiModelName={
   'gpt-3.5-turbo':'GPT-3.5',
   'claude-opus-4-8':'Claude Opus 4.8',
   'claude-opus-4-7':'Claude Opus 4.7',
+  'claude-sonnet-5':'Claude Sonnet 5',
   'claude-sonnet-4-6':'Claude Sonnet 4.6',
   'claude-sonnet-4-5':'Claude Sonnet 4.5',
   'claude-haiku-4-5-20251001':'Claude Haiku 4.5',
@@ -196,6 +200,33 @@ export const aiModelName={
 
 export const apikeyRe= /^[a-zA-Z0-9-_]{35,164}$/;
 
+// Optional per-vendor request URL ("请求地址") for AI gateways/relays. Unlike
+// the key (memory-only by policy), the URL is plain config and safe to persist,
+// so the user doesn't retype it every reload — the key is still required again.
+const BASE_URL_STORE_PREFIX = 'tronide.ai.baseUrl.'
+const loadBaseUrl = (vendor) => {
+  try { return window.localStorage.getItem(BASE_URL_STORE_PREFIX + vendor) || '' } catch (e) { return '' }
+}
+const saveBaseUrl = (vendor, url) => {
+  try {
+    if (url) window.localStorage.setItem(BASE_URL_STORE_PREFIX + vendor, url)
+    else window.localStorage.removeItem(BASE_URL_STORE_PREFIX + vendor)
+  } catch (e) { /* storage unavailable — the URL just won't persist */ }
+}
+// https only, except plain-http loopback for local relays (one-api/ollama etc.).
+// This is a SECURITY gate, not just a hint: onBaseUrlChange, the vendor switch
+// and the mount effect all refuse to persist or use a URL this rejects, so the
+// memory-only apiKey + prompt can never leave over cleartext http to a
+// non-loopback relay. Allowed: https (any host), or http on
+// localhost / 127.0.0.1 / [::1].
+export const baseUrlLooksValid = (u) => {
+  try {
+    const p = new URL(u)
+    if (p.protocol === 'https:') return true
+    return p.protocol === 'http:' && /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(p.host)
+  } catch (e) { return false }
+}
+
 const contextOptions = contextOptionsData.map((o) => ({
   value: o.value,
   label: (
@@ -206,24 +237,45 @@ const contextOptions = contextOptionsData.map((o) => ({
   )
 }))
 
-const ChatSet = ({ gptvHandle, apiKeyHandle,contextHandle,collapseHandle,enableStreamingHandle,enableStreaming ,getAiModelVendor}) => {
+const ChatSet = ({ gptvHandle, apiKeyHandle,contextHandle,collapseHandle,enableStreamingHandle,enableStreaming ,getAiModelVendor, baseUrlHandle, enableWorkspaceActions, workspaceActionsHandle}) => {
   const [openEye, setOpenEye] = useState(false)
   const [context, setContext] = useState('none')
   const [modelVendor, setModelVendor] = useState('Anthropic')
   const [modelVersion, setModelVersion] = useState(aiModelVendor[modelVendor]?.defaultValue||aiModelVendor[modelVendor]?.models[0]?.value)
   const [apiKey, setApiKey] = useState('')
+  const [baseUrl, setBaseUrl] = useState(() => loadBaseUrl('Anthropic'))
+  const [urlTip, setUrlTip] = useState(false)
   const timerRef = useRef();
   const [keyTip, setKeyTip] = useState(false);
+  // live mirror of the workspace-actions toggle — the streaming checkbox is
+  // meaningless while the (non-streaming) tool loop is active
+  const [waOn, setWaOn] = useState(!!enableWorkspaceActions);
+  // auto-re-mask backstop for the revealed API key
+  const revealTimerRef = useRef(null);
+  useEffect(() => () => { if (revealTimerRef.current) clearTimeout(revealTimerRef.current) }, []);
+
+  // Push the persisted request URL for the initial vendor up on mount, so a
+  // saved gateway is used even if the user never touches the field again.
+  // Gate on baseUrlLooksValid: a plain-http non-loopback URL persisted by an
+  // older build must not be used — fall back to the official endpoint.
+  useEffect(() => {
+    const saved = loadBaseUrl('Anthropic').trim()
+    if (saved && baseUrlLooksValid(saved)) baseUrlHandle && baseUrlHandle(saved)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const onOpenAPIkeyChange = (e) => {
-    const v=e.target.value
+    const raw = e.target.value
+    // Keys are pasted, and paste artifacts (a trailing linebreak / surrounding
+    // spaces from the provider console or a password manager) are invisible in
+    // a password field. The format hint below tests the TRIMMED value, so the
+    // stored key must be trimmed too — otherwise a key can look accepted here
+    // while the request goes out with the whitespace and 401s at the vendor.
+    const v = raw.trim()
     apiKeyHandle && apiKeyHandle(v)
-    setApiKey(v)
-    if(!(apikeyRe?.test(v?.trim()))){
-      setKeyTip(true);
-    }else{
-      setKeyTip(false);
-    }
+    setApiKey(raw)
+    // Advisory only — never blocks; requests use the key either way. An empty
+    // field is "no key yet", not a format error.
+    setKeyTip(!!v && !(apikeyRe?.test(v)));
     if(v){
        if (timerRef.current) {
           clearTimeout(timerRef.current);
@@ -247,7 +299,32 @@ const ChatSet = ({ gptvHandle, apiKeyHandle,contextHandle,collapseHandle,enableS
     apiKeyHandle && apiKeyHandle('')
     setKeyTip(false);
     setApiKey('')
+    // Each vendor keeps its own saved request URL — load the new vendor's one.
+    const nextUrl = loadBaseUrl(e)
+    const nextTrimmed = nextUrl.trim()
+    setBaseUrl(nextUrl)
+    const nextInvalid = !!nextTrimmed && !baseUrlLooksValid(nextTrimmed)
+    setUrlTip(nextInvalid)
+    // Only push a validated (or empty) URL up; a stale plain-http non-loopback
+    // relay is shown + hinted but not used — fall back to the official endpoint.
+    baseUrlHandle && baseUrlHandle(nextInvalid ? '' : nextTrimmed)
     gtag("event", "ai_vendor", {event_category: "ai_user_action",event_label: `select_vendor_${e}`})
+  }
+
+  const onBaseUrlChange = (e) => {
+    const raw = e.target.value
+    const v = raw.trim()
+    setBaseUrl(raw)
+    // Advisory hint on a non-empty value that doesn't validate (wording below).
+    const invalid = !!v && !baseUrlLooksValid(v)
+    setUrlTip(invalid)
+    // Security gate (not advisory): only persist/use an empty value (→ official
+    // endpoint) or an https / loopback-http URL. A plain-http non-loopback relay
+    // is refused so the memory-only apiKey + prompt never go out over cleartext
+    // http; the previously saved/used gateway stays in effect until replaced.
+    if (invalid) return
+    saveBaseUrl(modelVendor, v)
+    baseUrlHandle && baseUrlHandle(v)
   }
 
   const onContextChange = (e) => {
@@ -309,29 +386,53 @@ const ChatSet = ({ gptvHandle, apiKeyHandle,contextHandle,collapseHandle,enableS
             type={openEye ? 'text' : 'password'}
             value={apiKey}
             onChange={onOpenAPIkeyChange}
+            onBlur={() => setOpenEye(false)}
             placeholder={'Paste your API Key here'}
             maxLength={200}
             autoComplete="off"
             spellCheck={false}
+            data-id="aiApiKeyInput"
             data-lpignore="true"
             data-1p-ignore="true"
             data-form-type="other"
             // status={keyTip?'error':''}
             suffix={
-              <div className="eye flex-center">
+              // preventDefault on mousedown keeps focus INSIDE the input while
+              // toggling — otherwise the eye click itself blurs the field and
+              // the blur-driven re-mask below can never see a later real blur.
+              <div className="eye flex-center" onMouseDown={(e) => e.preventDefault()}>
                 <IconComponent
                   className="tron-icon"
                   icon={openEye ? '#icon-password-see-copy' : '#icon-password-nosee-copy'}
                   onClick={(e) => {
                     e.stopPropagation()
-                    setOpenEye(!openEye)
+                    const next = !openEye
+                    setOpenEye(next)
+                    // a revealed key never stays visible indefinitely: re-mask
+                    // on real blur (below) and after 30s as a backstop
+                    if (revealTimerRef.current) clearTimeout(revealTimerRef.current)
+                    if (next) revealTimerRef.current = window.setTimeout(() => setOpenEye(false), 30000)
                   }}
                 />
               </div>
             }
           />
           {
-            keyTip?<div className='key-tip'>Your API key does not meet the requirements</div>:null
+            keyTip && !baseUrl.trim() ?<div className='key-tip' data-id='aiApiKeyHint'>This doesn't look like a complete API key — re-copy it in full from the provider console (it will still be tried as entered)</div>:null
+          }
+          <div className="open-ai-title" style={{ marginTop: 8 }}>Request URL (optional)</div>
+          <Input
+            type='text'
+            value={baseUrl}
+            onChange={onBaseUrlChange}
+            placeholder={`Gateway/relay base URL — empty uses the official ${modelVendor} endpoint`}
+            maxLength={300}
+            autoComplete="off"
+            spellCheck={false}
+            data-id="aiBaseUrlInput"
+          />
+          {
+            urlTip?<div className='key-tip' data-id='aiBaseUrlHint'>Use an https:// URL (plain http only for localhost). Include the path prefix your gateway requires, e.g. /v1 — it will still be tried as entered</div>:null
           }
           <div className='key-security-notice'>
             ⚠ Your API key is kept only in browser memory — never saved to disk and cleared when you close this panel or reload. Prefer a dedicated key with a low spend limit, and do not paste production keys. If you install an untrusted plugin while this key is set, revoke it immediately at the provider console.
@@ -347,7 +448,13 @@ const ChatSet = ({ gptvHandle, apiKeyHandle,contextHandle,collapseHandle,enableS
             options={aiModelVendor[modelVendor]?.models}
           ></Select>
           {
-            modelVendor==='DeepSeek'?null:<p><Checkbox onChange={onChangeGPTCheckbox} defaultChecked={enableStreaming}>Enable streaming response (generate replies in real time)</Checkbox></p>
+            modelVendor==='Anthropic'?<p><Checkbox data-id="aiWorkspaceActionsToggle" onChange={(e)=>{setWaOn(e.target.checked);workspaceActionsHandle&&workspaceActionsHandle(e.target.checked)}} defaultChecked={enableWorkspaceActions}>Allow workspace actions — the AI can create/read files in this workspace (asks before every write; replies are not streamed while on)</Checkbox></p>:null
+          }
+          {
+            /* The tool loop is inherently non-streaming; a checked-but-ignored
+               streaming checkbox read as a bug, so it is disabled while
+               workspace actions are on. */
+            modelVendor==='DeepSeek'?null:<p><Checkbox data-id="aiStreamingToggle" disabled={modelVendor==='Anthropic'&&waOn} onChange={onChangeGPTCheckbox} defaultChecked={enableStreaming}>Enable streaming response (generate replies in real time){modelVendor==='Anthropic'&&waOn?<span className="stream-toggle-note"> — not used while workspace actions are on</span>:null}</Checkbox></p>
           }
           {/* <p>Please ensure this API Key has access to {modelVersion||'GPT-4'} Model.</p> */}
         </div>

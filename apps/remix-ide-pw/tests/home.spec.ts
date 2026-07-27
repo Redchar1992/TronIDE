@@ -67,4 +67,29 @@ test.describe('Home / landing page smoke', () => {
     await expect(compileButton).toHaveAttribute('data-title', 'Open a .sol tab to compile')
     await expect(compileButton).toHaveClass(/disabled/)
   })
+
+  // The Git Workflow panel's second chip used to be a "Git Help" link to the
+  // repo root (not help, and easy to miss); it now opens the in-IDE Git panel.
+  // The export toast is also pinned to sentence case here.
+  test('TC-HOME-GIT-1: Git Workflow panel exports with a sentence-case toast and opens the Git panel', { tag: '@gate' }, async ({ page }) => {
+    await page.goto('/')
+    await dismissWelcomeModal(page)
+    await page.locator('[data-id="landingAdvancedToolsPanel"]').waitFor({ timeout: 30_000 })
+
+    // the panel lives behind the Advanced tools toggle (collapsed by default)
+    const toggle = page.locator('[data-id="landingAdvancedToolsToggle"]')
+    if (await toggle.textContent().then((t) => /Show/.test(t || ''))) await toggle.click()
+    await expect(page.locator('[data-id="landingGitWorkflowPanel"]')).toBeVisible()
+
+    // Export Workspace Zip → toast is sentence-case (was "preparing files ..")
+    const download = page.waitForEvent('download')
+    await page.locator('[data-id="landingGitPrepare"]').click()
+    await expect(page.locator('[data-shared="tooltipPopup"]').filter({ hasText: 'Preparing files for download' }).first())
+      .toBeVisible({ timeout: 10_000 })
+    await (await download).cancel()
+
+    // Open Git Panel lands on the real in-IDE git panel, not an external link
+    await page.locator('[data-id="landingGitOpenPanel"]').click()
+    await expect(page.locator('[data-id="gitPanel"]')).toBeVisible({ timeout: 15_000 })
+  })
 })

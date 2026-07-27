@@ -27,6 +27,7 @@ const { hashPersonalMessage } = require('../../lib/helper')
 class VMProvider {
   constructor (executionContext) {
     this.executionContext = executionContext
+    this.fork = null
   }
 
   getAccounts (cb) {
@@ -38,9 +39,21 @@ class VMProvider {
     })
   }
 
-  resetEnvironment () {
+  resetEnvironment ({ preserveState = false } = {}) {
+    const fork = this.executionContext.getCurrentFork()
+    // Switching to Injected TronWeb and back must not silently destroy the
+    // in-memory chain. Reuse the existing simulator when the VM fork is
+    // unchanged so terminal transaction hashes remain debuggable. A full app
+    // initialization still calls this without preserveState and creates a
+    // fresh VM, which keeps reload/reset semantics intact.
+    if (preserveState && this.RemixSimulatorProvider && this.web3 && this.fork === fork) {
+      this.executionContext.setWeb3('vm', this.web3)
+      return
+    }
+
     this.accounts = {}
-    this.RemixSimulatorProvider = new Provider({ fork: this.executionContext.getCurrentFork() })
+    this.fork = fork
+    this.RemixSimulatorProvider = new Provider({ fork })
     this.RemixSimulatorProvider.init().catch(err => {
       console.error('Failed to initialize RemixSimulatorProvider:', err)
     })

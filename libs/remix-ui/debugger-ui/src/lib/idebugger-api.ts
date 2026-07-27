@@ -18,6 +18,7 @@
  */
 
 import type { CompilationResult, CompilationSource } from '@remix-project/remix-solidity-ts' // eslint-disable-line
+import type { DebugTraceCapability } from './debug-trace-capability'
 
 export interface DebuggerUIProps {
     debuggerAPI: IDebuggerApi
@@ -81,5 +82,6 @@ export interface IDebuggerApi {
     getFile: (path: string) => Promise<string>
     setFile: (path: string, content: string) => Promise<void>
     getDebugWeb3: () => any // returns an instance of web3.js
+    getDebugTraceCapability?: () => Promise<DebugTraceCapability>
     showMessage (title: string, message: string): void
 }

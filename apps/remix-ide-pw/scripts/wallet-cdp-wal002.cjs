@@ -54,12 +54,13 @@ function walletPopups (browser) {
     }
 
     const header = ((await headerBtn.textContent()) || '').trim()
+    const connected = (await headerBtn.getAttribute('aria-haspopup')) === 'menu'
     const envValue = await page.locator('select#selectExEnvOptions').inputValue().catch(() => 'n/a')
     const accCount = await page.locator('select[data-id="runTabSelectAccount"] option').count().catch(() => -1)
     log('header:', header, '| env:', envValue, '| accounts:', accCount)
     await page.screenshot({ path: `${SHOTS}/w2-ide-state.png` }).catch(() => {})
 
-    check('TC-WAL-002 not connected', !/Wallet T\w/.test(header), `header="${header}"`)
+    check('TC-WAL-002 not connected', !connected, `header="${header}"`)
     check('TC-WAL-002 unlock guidance', /unlock|Connecting|connect TronLink/i.test(header), `header="${header}"`)
     check('TC-WAL-002 env stays safe', envValue === 'vm-tron', `env=${envValue}`)
     check('TC-WAL-002 no account leaked', accCount <= 0 || !/^T/.test(((await page.locator('select[data-id="runTabSelectAccount"] option').first().textContent().catch(() => '')) || '').trim().slice(0, 1)) || envValue === 'vm-tron', `accounts=${accCount} (vm accounts are fine)`)

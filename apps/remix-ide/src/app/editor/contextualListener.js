@@ -68,7 +68,11 @@ class ContextualListener extends Plugin {
     }
     this._compilationFinishedRegistered = false
     this._onCompilationFinished = (file, source, languageVersion, data) => {
-      if (languageVersion.indexOf('soljson') !== 0) return
+      // languageVersion used to be the literal 'soljson'; the compiler now
+      // reports its REAL version (e.g. "0.8.6+commit...", or 'unknown'). A
+      // positive 'soljson' prefix test would drop every compilation and kill
+      // highlighting — only skip compilers that are explicitly not solc.
+      if (!languageVersion || languageVersion.indexOf('vyper') === 0) return
       this._stopHighlighting()
       this._index = {
         Declarations: {},
@@ -101,7 +105,9 @@ class ContextualListener extends Plugin {
     this._compilationFinishedRegistered = true
 
     this._highlightInterval = setInterval(() => {
-      if (this._deps.compilersArtefacts.__last && this._deps.compilersArtefacts.__last.languageversion && this._deps.compilersArtefacts.__last.languageversion.indexOf('soljson') === 0) {
+      // see _onCompilationFinished: languageversion is now the real solc
+      // version, so gate on "not a non-solc compiler" instead of 'soljson'
+      if (this._deps.compilersArtefacts.__last && this._deps.compilersArtefacts.__last.languageversion && this._deps.compilersArtefacts.__last.languageversion.indexOf('vyper') !== 0) {
         this._highlightItems(this.editor.getCursorPosition(), this._deps.compilersArtefacts.__last, this._deps.config.get('currentFile'))
       }
     }, 1000)

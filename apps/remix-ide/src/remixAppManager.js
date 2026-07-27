@@ -22,6 +22,7 @@ import { PluginManager } from '@remixproject/engine'
 import { SecureIframePlugin as IframePlugin } from './app/components/secure-iframe-plugin'
 import { EventEmitter } from 'events'
 import QueryParams from './lib/query-params'
+import { filterUrlPluginNames } from './lib/url-param-security'
 import { PermissionHandler } from './app/ui/persmission-handler'
 const _paq = window._paq = window._paq || []
 
@@ -33,7 +34,7 @@ const requiredModules = [ // services + layout views + system views
 const dependentModules = ['git', 'hardhat'] // module which shouldn't be manually activated (e.g git is activated by remixd)
 
 export function isNative (name) {
-  const nativePlugins = ['vyper', 'workshops', 'debugger', 'remixd', 'menuicons', 'solidity', 'hardhat-provider', 'solidityStaticAnalysis', 'solidityUnitTesting']
+  const nativePlugins = ['vyper', 'workshops', 'debugger', 'remixd', 'menuicons', 'solidity', 'hardhat-provider', 'solidityStaticAnalysis', 'solidityUnitTesting', 'contractVerification', 'gitPanel', 'solidityUml']
   return nativePlugins.includes(name) || requiredModules.includes(name)
 }
 
@@ -48,8 +49,7 @@ export function isNative (name) {
  * @returns {boolean}
  */
 export function canActivate (from, to) {
-  return ['ethdoc'].includes(from.name) ||
-  isNative(from.name) ||
+  return isNative(from.name) ||
   (to && from && from.canActivate && from.canActivate.includes(to.name))
 }
 
@@ -76,7 +76,7 @@ export class RemixAppManager extends PluginManager {
       await this.getProfile(name),
       await this.getProfile(this.requestFrom)
     ]
-    if (this.canDeactivatePlugin(from, to)) {
+    if (await this.canDeactivatePlugin(from, to)) {
       await this.toggleActive(name)
     }
   }
@@ -153,7 +153,10 @@ export class RemixAppManager extends PluginManager {
           kind: 'none',
           icon: '/assets/plugins/scriptRunner/icon.png',
           location: 'hiddenPanel',
-          url: '/assets/plugins/scriptRunner',
+          // Use the concrete file, not the directory URL. The test host redirects
+          // a slashless HTTPS directory to HTTP, which mixed-content blocking
+          // turns into a plugin activation that never completes.
+          url: '/assets/plugins/scriptRunner/index.html',
           repo: 'https://github.com/bunsenstraat/remix-script-runner',
           maintainedBy: 'Remix',
           authorContact: ''
@@ -166,9 +169,12 @@ export class RemixAppManager extends PluginManager {
           version: '0.1.0',
           events: [],
           methods: [],
+          // Keep remembered permissions bound to the bundled plugin content.
+          // The regression test recomputes this from index.html + bundle.js.
+          hash: 'sha256:23dfd39f77246e306a809dd5f5c5bda6cf26fc3f8a9a95c83c29bdda2491140e',
           icon: '/assets/plugins/restorebackupzip/icon.png',
           location: 'mainPanel',
-          url: '/assets/plugins/restorebackupzip',
+          url: '/assets/plugins/restorebackupzip/index.html',
           targets: [
             'remix'
           ],
@@ -225,7 +231,7 @@ class PluginLoader {
       get: () => {
         const { activate } = queryParams.get()
         if (!activate) return []
-        return activate.split(',')
+        return filterUrlPluginNames(activate)
       }
     }
 

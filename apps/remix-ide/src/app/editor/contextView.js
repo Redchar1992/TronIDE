@@ -117,7 +117,9 @@ class ContextView {
       }
     }
     const lastCompilationResult = this._deps.compilersArtefacts.__last
-    if (lastCompilationResult && lastCompilationResult.languageversion.indexOf('soljson') === 0 && lastCompilationResult.data) {
+    // languageversion now carries the real solc version (not 'soljson') — gate
+    // on "not a non-solc compiler" so the context widget keeps working
+    if (lastCompilationResult && lastCompilationResult.languageversion && lastCompilationResult.languageversion.indexOf('vyper') !== 0 && lastCompilationResult.data) {
       const lineColumn = this._deps.offsetToLineColumnConverter.offsetToLineColumn(
         position,
         position.file,

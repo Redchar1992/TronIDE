@@ -70,8 +70,8 @@ function initModules (browser: NightwatchBrowser, callback: VoidFunction) {
     .scrollAndClick('[data-id="verticalIconsKindfilePanel"]')
     .clickLaunchIcon('settings')
     .click('*[data-id="settingsTabGenerateContractMetadataLabel"]')
-    .setValue('[data-id="settingsTabGistAccessToken"]', process.env.gist_token)
-    .click('[data-id="settingsTabSaveGistToken"]')
+    // The Settings gist-token panel is retired (GitHub tokens are memory-only);
+    // gist specs that need auth connect through the Home GitHub flow instead.
     .clickIfPresent('[data-id="settingsTabThemeLabelFlatly"]') // e2e tests were initially developed with Flatly. Some tests are failing with the default one (Dark), because the dark theme put uppercase everywhere.
     .perform(() => { callback() })
 }

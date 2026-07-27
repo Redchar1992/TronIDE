@@ -67,9 +67,10 @@ async function tapInPopup (browser, label, timeoutMs) {
     // The IDE must settle in a NOT-connected state with a normalized message.
     await page.waitForTimeout(5000)
     const header = await headerText()
+    const connected = (await page.locator('[data-id="headerWalletConnect"]').getAttribute('aria-haspopup')) === 'menu'
     log('header after reject:', header)
     await page.screenshot({ path: `${SHOTS}/w3-after-reject.png` }).catch(() => {})
-    check('TC-WAL-003 not connected', !/Wallet T/.test(header), `header="${header}"`)
+    check('TC-WAL-003 not connected', !connected, `header="${header}"`)
     check('TC-WAL-003 normalized message', /Connect Wallet/.test(header), `header carries a user-readable state: "${header}"`)
     const envValue = await page.locator('select#selectExEnvOptions').inputValue().catch(() => 'n/a')
     const accCount = await page.locator('select[data-id="runTabSelectAccount"] option').count().catch(() => -1)

@@ -39,6 +39,7 @@ import {
 } from './actions/fileSystem'
 import * as helper from '../../../../../apps/remix-ide/src/lib/helper'
 import QueryParams from '../../../../../apps/remix-ide/src/lib/query-params'
+import * as githubAuth from '../../../../../apps/remix-ide/src/lib/github-auth'
 import { customAction } from '@remixproject/plugin-api'
 
 import './css/file-explorer.css'
@@ -116,6 +117,16 @@ export const FileExplorer = (props: FileExplorerProps) => {
         path: [],
         // extension: ['.js'],
         extension: ['.notSupported'],
+        pattern: [],
+        multiselect: false,
+        label: ''
+      },
+      {
+        id: 'formatCode',
+        name: 'Format code',
+        type: [],
+        path: [],
+        extension: ['.sol', '.js', '.ts', '.json'],
         pattern: [],
         multiselect: false,
         label: ''
@@ -207,6 +218,11 @@ export const FileExplorer = (props: FileExplorerProps) => {
     fileSystemInitialState
   )
   const editRef = useRef(null)
+  // In-flight guard for the Format action: prettier's chunk is ~1.6 MB and the
+  // format itself is synchronous, so a slow fetch or large file can take a
+  // while. Without this a second click would queue another format (M2) — we
+  // ignore re-clicks while one is running and reset in finally (v2.3.0 spirit).
+  const formatInFlight = useRef(false)
 
   useEffect(() => {
     init(props.filesProvider, props.plugin, props.registry)(dispatch)
@@ -451,13 +467,17 @@ export const FileExplorer = (props: FileExplorerProps) => {
 
   const createNewFile = async (newFilePath: string) => {
     const fileManager = state.fileManager
+    const filesProvider = fileSystem.provider.provider
+    const mutationContext = typeof filesProvider.captureMutationContext === 'function'
+      ? filesProvider.captureMutationContext()
+      : undefined
 
     try {
       const newName = await helper.createNonClashingNameAsync(
         newFilePath,
         fileManager
       )
-      const createFile = await fileManager.writeFile(newName, '')
+      const createFile = await fileManager.writeFile(newName, '', mutationContext)
 
       if (!createFile) {
         return toast('Failed to create file ' + newName)
@@ -487,6 +507,10 @@ export const FileExplorer = (props: FileExplorerProps) => {
 
   const createNewFolder = async (newFolderPath: string) => {
     const fileManager = state.fileManager
+    const filesProvider = fileSystem.provider.provider
+    const mutationContext = typeof filesProvider.captureMutationContext === 'function'
+      ? filesProvider.captureMutationContext()
+      : undefined
     const dirName = newFolderPath + '/'
 
     try {
@@ -502,7 +526,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
           () => {}
         )
       }
-      await fileManager.mkdir(dirName)
+      await fileManager.mkdir(dirName, mutationContext)
       setState(prevState => {
         return {
           ...prevState,
@@ -521,6 +545,11 @@ export const FileExplorer = (props: FileExplorerProps) => {
 
   const deletePath = async (path: string | string[]) => {
     const filesProvider = fileSystem.provider.provider
+    // Bind the delete approval before the modal opens. FileManager must not
+    // capture whichever branch happens to be active only after OK is clicked.
+    const mutationContext = typeof filesProvider.captureMutationContext === 'function'
+      ? filesProvider.captureMutationContext()
+      : undefined
     if (!Array.isArray(path)) path = [path]
     for (const p of path) {
       if (filesProvider.isReadOnly(p)) {
@@ -537,7 +566,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
         const fileManager = state.fileManager
         for (const p of path) {
           try {
-            await fileManager.remove(p)
+            await fileManager.remove(p, mutationContext)
           } catch (e) {
             const isDir = await state.fileManager.isDirectory(p)
             toast(`Failed to remove ${isDir ? 'folder' : 'file'} ${p}.`)
@@ -550,6 +579,10 @@ export const FileExplorer = (props: FileExplorerProps) => {
   }
 
   const renamePath = async (oldPath: string, newPath: string) => {
+    const filesProvider = fileSystem.provider.provider
+    const mutationContext = typeof filesProvider.captureMutationContext === 'function'
+      ? filesProvider.captureMutationContext()
+      : undefined
     try {
       const fileManager = state.fileManager
       const exists = await fileManager.exists(newPath)
@@ -564,7 +597,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
           () => {}
         )
       } else {
-        await fileManager.rename(oldPath, newPath)
+        await fileManager.rename(oldPath, newPath, mutationContext)
       }
     } catch (error) {
       modal(
@@ -580,6 +613,12 @@ export const FileExplorer = (props: FileExplorerProps) => {
 
   const uploadFile = target => {
     const filesProvider = fileSystem.provider.provider
+    // Bind the user's upload intent before FileReader / overwrite confirmation
+    // yields. A checkout or workspace switch invalidates this generation, so a
+    // late onload cannot write the source-workspace file into the new branch.
+    const mutationContext = typeof filesProvider.captureMutationContext === 'function'
+      ? filesProvider.captureMutationContext()
+      : undefined
     // TODO The file explorer is merely a view on the current state of
     // the files module. Please ask the user here if they want to overwrite
     // a file and then just use `files.add`. The file explorer will
@@ -622,7 +661,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
             }
             content = 'data:application/octet-stream;base64,' + btoa(binary)
           }
-          const success = await filesProvider.set(name, content)
+          const success = await filesProvider.set(name, content, undefined, mutationContext)
 
           if (!success) {
             return modal(
@@ -781,7 +820,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
             'The gist could not be found. It may have been deleted, or the configured access token does not have permission to read it.'
         } else if (status === 401 || status === 403 || /\b401\b|\b403\b|Bad credentials|rate limit/i.test(detail)) {
           message =
-            'GitHub rejected the request. Please check that your gist access token is valid and has gist permission (settings tab). ' +
+            'GitHub rejected the request. Reconnect GitHub with gist permission ("Connect GitHub" on the Home page or the header button), then try again. ' +
             detail
         } else if (
           error instanceof TypeError ||
@@ -861,14 +900,15 @@ export const FileExplorer = (props: FileExplorerProps) => {
           async () => {}
         )
       } else {
-        // check for token
-        const config = registry.get('config').api
-        const accessToken = config.get('settings/gist-access-token')
+        // Publishing needs the in-memory GitHub connect token (lib/github-auth, set
+        // by the Home/Header "Connect GitHub" flow). The legacy Settings-tab PAT
+        // channel is retired — tokens are tab-scoped and never read from config.
+        const accessToken = (githubAuth.getToken() || '').trim()
 
         if (!accessToken) {
           modal(
-            'Authorize Token',
-            'TronIDE requires an access token (which includes gists creation permission). Please go to the settings tab to create one.',
+            'Connect GitHub',
+            'Publishing a gist needs a GitHub connection that can create gists. Use "Connect GitHub" on the Home page (or the header button) to sign in, then publish again.',
             'Close',
             () => {}
           )
@@ -959,6 +999,38 @@ export const FileExplorer = (props: FileExplorerProps) => {
       }
       plugin.call('scriptRunner', 'execute', content)
     })
+  }
+
+  const formatCode = async (path: string) => {
+    // Ignore re-clicks while a format is already running so we don't queue a
+    // second (unbounded) lazy-import + format on the same or another file.
+    if (formatInFlight.current) {
+      return toast('Formatting in progress, please wait…')
+    }
+    formatInFlight.current = true
+    // Surface that work started — the prettier chunk fetch + format can take a
+    // moment, so we never leave the action silently hanging.
+    toast(`Formatting ${extractNameFromKey(path)}…`)
+    try {
+      // fileManager.readFile returns the LIVE editor content when the file is
+      // open — reading the provider directly would format the stale on-disk
+      // copy and wipe any unsaved edits on write-back (DEF-R2-1)
+      const content: string = await plugin.call('fileManager', 'readFile', path)
+      const { formatSource } = await import('./code-formatter')
+      const formatted = await formatSource(path, content)
+      if (formatted === content) return toast(`${extractNameFromKey(path)} is already formatted.`)
+      // fileManager.writeFile syncs the editor when the file is open
+      await plugin.call('fileManager', 'writeFile', path, formatted)
+      toast(`Formatted ${extractNameFromKey(path)}.`)
+    } catch (e) {
+      // syntax errors abort the format and leave the file untouched
+      const message = (e && e.message) ? e.message.split('\n')[0] : String(e)
+      toast(`Could not format ${extractNameFromKey(path)}: ${message}`)
+    } finally {
+      // Always release the guard so the action stays usable after success,
+      // syntax error, or a slow/failed chunk fetch.
+      formatInFlight.current = false
+    }
   }
 
   const emitContextMenuEvent = (cmd: customAction) => {
@@ -1332,6 +1404,21 @@ export const FileExplorer = (props: FileExplorerProps) => {
     )
   }
 
+  const contextMenuPosition = (event: React.MouseEvent<HTMLElement>) => {
+    // A real pointer event supplies viewport coordinates. Keyboard-triggered
+    // context menus and WebDriver's synthetic contextmenu event commonly
+    // report (0, 0); anchor those to the tree row instead of placing the menu
+    // underneath the fixed TronIDE header/logo.
+    if (event.clientX !== 0 || event.clientY !== 0) {
+      return { x: event.clientX, y: event.clientY }
+    }
+    const boundary = event.currentTarget.getBoundingClientRect()
+    return {
+      x: boundary.left + Math.min(16, boundary.width),
+      y: boundary.bottom
+    }
+  }
+
   const renderFiles = (file: File, index: number) => {
     if (
       !file ||
@@ -1371,9 +1458,10 @@ export const FileExplorer = (props: FileExplorerProps) => {
           onContextMenu={e => {
             e.preventDefault()
             e.stopPropagation()
+            const position = contextMenuPosition(e)
             handleContextMenuFolder(
-              e.pageX,
-              e.pageY,
+              position.x,
+              position.y,
               file.path,
               e.target.textContent,
               file.type
@@ -1423,9 +1511,10 @@ export const FileExplorer = (props: FileExplorerProps) => {
           onContextMenu={e => {
             e.preventDefault()
             e.stopPropagation()
+            const position = contextMenuPosition(e)
             handleContextMenuFile(
-              e.pageX,
-              e.pageY,
+              position.x,
+              position.y,
               file.path,
               e.target.textContent,
               file.type
@@ -1543,6 +1632,7 @@ export const FileExplorer = (props: FileExplorerProps) => {
           deletePath={deletePath}
           renamePath={editModeOn}
           runScript={runScript}
+          formatCode={formatCode}
           copy={handleCopyClick}
           paste={handlePasteClick}
           emit={emitContextMenuEvent}

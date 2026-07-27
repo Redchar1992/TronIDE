@@ -21,18 +21,19 @@
 
 var test = require('tape')
 var GistHandler = require('../src/lib/gist-handler')
+var githubAuth = require('../src/lib/github-auth')
 
 test('GistHandler.handleLoad accepts direct gist ids', function (t) {
   t.plan(2)
 
   var handler = new GistHandler({})
   var calledWith = null
-  var loading = handler.handleLoad({ gist: 'abcdef123456' }, function (gistId) {
+  var loading = handler.handleLoad({ gist: 'abcdef1234567890abcd' }, function (gistId) {
     calledWith = gistId
   })
 
   t.equal(loading, true)
-  t.equal(calledWith, 'abcdef123456')
+  t.equal(calledWith, 'abcdef1234567890abcd')
 })
 
 test('GistHandler.handleLoad extracts ids from prompted urls', function (t) {
@@ -40,7 +41,7 @@ test('GistHandler.handleLoad extracts ids from prompted urls', function (t) {
 
   var modal = {
     prompt: function (_title, _text, _value, ok) {
-      ok('https://gist.github.com/tron/abcdef1234567890')
+      ok('https://gist.github.com/tron/abcdef1234567890abcd')
     },
     alert: function () {}
   }
@@ -51,7 +52,20 @@ test('GistHandler.handleLoad extracts ids from prompted urls', function (t) {
   })
 
   t.equal(loading, true)
-  t.equal(calledWith, 'abcdef1234567890')
+  t.equal(calledWith, 'abcdef1234567890abcd')
+})
+
+test('GistHandler.handleLoad rejects an id-shaped substring in a URL parameter', function (t) {
+  t.plan(2)
+
+  var handler = new GistHandler({})
+  var called = false
+  var loading = handler.handleLoad({ gist: 'attacker-abcdef1234567890abcd-suffix' }, function () {
+    called = true
+  })
+
+  t.equal(loading, false, 'invalid parameter is not treated as a gist load')
+  t.equal(called, false, 'invalid parameter never reaches the fetch callback')
 })
 
 test('GistHandler.handleLoad redacts github token-like values before id extraction', function (t) {
@@ -81,14 +95,17 @@ test('GistHandler.handleLoad redacts github token-like values before id extracti
 // skip (with an alert) a file whose content cannot be recovered — never writing a
 // blank file. fetch + fileManager are stubbed so this is deterministic.
 test('GistHandler.loadFromGist writes content, backfills truncated files, and skips unrecoverable ones', function (t) {
-  t.plan(4)
+  t.plan(6)
   var GID = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6'
   var INLINE = 'contract Inline { uint256 a = 1; }'
   var BIG = 'contract Big { uint256 b = 2; }'
+  var boundContext = { workspace: 'gist-sample', generation: 7 }
+  var contextCaptured = false
   global.window = {
     fetch: function (url) {
       var u = String(url)
       if (u.indexOf('api.github.com/gists/') !== -1) {
+        t.equal(contextCaptured, true, 'workspace context captured before the gist request starts')
         var payload = JSON.stringify({
           id: GID,
           files: {
@@ -106,11 +123,16 @@ test('GistHandler.loadFromGist writes content, backfills truncated files, and sk
   var alertMsg = null
   var handler = new GistHandler({ prompt: function () {}, alert: function (_title, m) { alertMsg = m } })
   var fileManager = {
+    captureWorkspaceMutationContext: function () {
+      contextCaptured = true
+      return boundContext
+    },
     getProvider: function () { return { lastLoadedGistId: null } },
-    setBatchFiles: function (obj, _ws, _override, cb) {
+    setBatchFiles: function (obj, _ws, _override, cb, mutationContext) {
       var keyOf = function (name) { return Object.keys(obj).filter(function (k) { return k.indexOf('/' + name) !== -1 })[0] }
       var inlineKey = keyOf('Inline.sol')
       var bigKey = keyOf('Big.sol')
+      t.equal(mutationContext, boundContext, 'the pre-fetch workspace context reaches the batch write')
       t.equal(inlineKey && obj[inlineKey].content, INLINE, 'inline file written with its content')
       t.equal(bigKey && obj[bigKey].content, BIG, 'truncated Big.sol backfilled from raw_url')
       t.equal(keyOf('Lost.sol'), undefined, 'unrecoverable Lost.sol is NOT written (no blank file)')
@@ -154,6 +176,7 @@ test('GistHandler.loadFromGist strips .deps/ files baked into a gist', function 
   var alertMsg = null
   var handler = new GistHandler({ prompt: function () {}, alert: function (_title, m) { alertMsg = m } })
   var fileManager = {
+    captureWorkspaceMutationContext: function () { return { workspace: 'gist-sample', generation: 1 } },
     getProvider: function () { return { lastLoadedGistId: null } },
     setBatchFiles: function (obj, _ws, _override, cb) {
       var keys = Object.keys(obj)
@@ -178,15 +201,7 @@ test('GistHandler.loadFromGist does not send Authorization on raw_url fetches (C
   var GID = 'b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7'
   var BIG = 'contract Big { uint256 b = 2; }'
 
-  // Stub the registry so getGistAccessToken() returns a token.
-  var registryPath = require.resolve('../src/global/registry')
-  var savedRegistry = require.cache[registryPath]
-  require.cache[registryPath] = {
-    id: registryPath,
-    filename: registryPath,
-    loaded: true,
-    exports: { get: function () { return { api: { get: function () { return 'ghp_testtoken1234567890' } } } } }
-  }
+  githubAuth.setToken('ghp_testtoken1234567890')
 
   var apiAuth = 'MISSING'
   var rawAuth = 'MISSING'
@@ -208,13 +223,14 @@ test('GistHandler.loadFromGist does not send Authorization on raw_url fetches (C
   }
   var handler = new GistHandler({ prompt: function () {}, alert: function () {} })
   var fileManager = {
+    captureWorkspaceMutationContext: function () { return { workspace: 'gist-sample', generation: 1 } },
     getProvider: function () { return { lastLoadedGistId: null } },
     setBatchFiles: function (_obj, _ws, _override, cb) {
       t.equal(apiAuth, 'token ghp_testtoken1234567890', 'api.github.com request carries the token')
       t.equal(rawAuth, undefined, 'raw_url request sends NO Authorization header (stays CORS-simple)')
       t.equal(_obj && Object.keys(_obj).length, 1, 'truncated file still backfilled from raw_url')
       delete global.window
-      if (savedRegistry) require.cache[registryPath] = savedRegistry; else delete require.cache[registryPath]
+      githubAuth.clearToken()
       if (cb) cb()
     }
   }

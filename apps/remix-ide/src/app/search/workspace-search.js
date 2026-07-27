@@ -340,9 +340,48 @@ function escapeRegex (value) {
   return String(value).replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')
 }
 
+// Text-ish files worth scanning; everything else (images, wasm, artifacts
+// blobs) is skipped at collection time.
+const SEARCHABLE_FILE_RE = /\.(sol|js|ts|tsx|json|md|txt|yul|move|rs|py|css|html)$/i
+
+// Walk the current workspace through a fileManager-like host (readdir/readFile)
+// and collect searchable files for searchWorkspaceFiles. UI-free on purpose:
+// shared by the Search panel and the AI assistant's search_workspace tool.
+// Collection-side skips/warnings are RETURNED (not pushed into caller state).
+async function collectSearchableFiles (fileManager, limits = DEFAULT_LIMITS) {
+  const files = []
+  const warnings = []
+  let skippedFiles = 0
+  const walk = async (dir) => {
+    if (files.length >= limits.maxFiles) return
+    const entries = await fileManager.readdir(dir || '/')
+    const names = Object.keys(entries || {}).sort()
+    for (const name of names) {
+      if (files.length >= limits.maxFiles) return
+      const entry = entries[name]
+      const path = (entry && entry.path) || name
+      if (entry && entry.isDirectory) {
+        await walk(path)
+      } else if (SEARCHABLE_FILE_RE.test(path)) {
+        try {
+          const content = await fileManager.readFile(path)
+          files.push({ path, content })
+        } catch (error) {
+          skippedFiles++
+          warnings.push(`Skipped ${path}: ${(error && error.message) || error}`)
+        }
+      }
+    }
+  }
+  await walk('')
+  return { files, skippedFiles, warnings }
+}
+
 module.exports = {
   searchWorkspaceFiles,
   createWorkspaceReplacePreview,
+  collectSearchableFiles,
+  SEARCHABLE_FILE_RE,
   DEFAULT_LIMITS,
   DEFAULT_INCLUDE_PATTERN,
   DEFAULT_EXCLUDE_PATTERN,

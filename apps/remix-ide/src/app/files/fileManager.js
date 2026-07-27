@@ -42,7 +42,10 @@ const profile = {
   icon: 'assets/img/fileManager.webp',
   permission: true,
   version: packageJson.version,
-  methods: ['file', 'exists', 'open', 'writeFile', 'readFile', 'copyFile', 'copyDir', 'rename', 'mkdir', 'readdir', 'remove', 'getCurrentFile', 'getFile', 'getFolder', 'setFile', 'switchFile', 'refresh', 'getProviderOf', 'getProviderByName'],
+  // The checked-save/rewrite-lock/sync trio brackets Git operations that
+  // replace worktree files. getOpenedFiles lets the AI panel see which tabs
+  // are open without a key ever leaving.
+  methods: ['file', 'exists', 'open', 'writeFile', 'readFile', 'copyFile', 'copyDir', 'rename', 'mkdir', 'readdir', 'remove', 'getCurrentFile', 'getOpenedFiles', 'getFile', 'getFolder', 'setFile', 'switchFile', 'refresh', 'getProviderOf', 'getProviderByName', 'saveCurrentFileChecked', 'captureWorkspaceMutationContext', 'beginWorkspaceRewrite', 'endWorkspaceRewrite', 'syncEditor', 'reconcileOpenFilesAfterRewrite'],
   kind: 'file-system'
 }
 const errorMsg = {
@@ -63,6 +66,10 @@ class FileManager extends Plugin {
     this.openedFiles = {} // list all opened files
     this.events = new EventEmitter()
     this.editor = editor
+    this._workspaceRewriteLock = null
+    this._workspaceRewriteToken = 0
+    this._workspaceMutationOwner = null
+    this._workspaceMutationSequence = 0
     this._components = {}
     this._components.registry = globalRegistry
     this.appManager = appManager
@@ -75,6 +82,51 @@ class FileManager extends Plugin {
 
   setMode (mode) {
     this.mode = mode
+  }
+
+  _assertNoWorkspaceRewrite (action) {
+    if (this._workspaceRewriteLock) throw new Error(`Cannot ${action} while Git is switching or updating the workspace.`)
+  }
+
+  assertWorkspaceMutationAllowed (action = 'change workspaces') {
+    this._assertNoWorkspaceRewrite(action)
+    return true
+  }
+
+  beginWorkspaceMutation (action = 'change workspaces') {
+    this._assertNoWorkspaceRewrite(action)
+    if (this._workspaceMutationOwner !== null) throw new Error('Another workspace change is already in progress.')
+    const token = ++this._workspaceMutationSequence
+    this._workspaceMutationOwner = token
+    return token
+  }
+
+  assertWorkspaceMutationToken (token) {
+    this._assertNoWorkspaceRewrite('change workspaces')
+    if (this._workspaceMutationOwner !== token) throw new Error('The workspace change is no longer active.')
+    return true
+  }
+
+  endWorkspaceMutation (token) {
+    if (this._workspaceMutationOwner !== token) return false
+    this._workspaceMutationOwner = null
+    return true
+  }
+
+  _captureWorkspaceMutationContext (path) {
+    try {
+      const provider = this.fileProviderOf(path || '/')
+      return provider && typeof provider.captureMutationContext === 'function'
+        ? provider.captureMutationContext()
+        : undefined
+    } catch (error) { return undefined }
+  }
+
+  captureWorkspaceMutationContext (path = '/') {
+    path = this.limitPluginScope(path)
+    const context = this._captureWorkspaceMutationContext(path)
+    if (!context) throw new Error('The active workspace could not be bound to this file operation.')
+    return context
   }
 
   limitPluginScope (path) {
@@ -152,10 +204,30 @@ class FileManager extends Plugin {
   /*
   * refresh the file explorer
   */
-  refresh () {
+  refresh (changedPaths = []) {
     const provider = this.fileProviderOf('/')
     // emit folderAdded so that File Explorer reloads the file tree
     provider.event.emit('folderAdded', '/')
+    // A root-only refresh merges the existing nested tree and can leave an
+    // expanded folder stale after raw Git restores/removes a file. Treat each
+    // affected filepath as a folder-change hint: the explorer refresh handler
+    // intentionally reloads its parent directory.
+    // The root event above already refreshes root-level files.
+    const hintedParents = new Set(['/'])
+    for (const filepath of Array.isArray(changedPaths) ? changedPaths : []) {
+      if (!filepath) continue
+      const hint = String(filepath).replace(/^\/+|\/+$/g, '')
+      const separator = hint.lastIndexOf('/')
+      const parent = separator < 0 ? '/' : hint.slice(0, separator)
+      // folderAdded derives the directory to reload from the hint's parent.
+      // One representative child per parent is enough; emitting every tracked
+      // file during checkout can otherwise enqueue thousands of identical tree
+      // reloads for a large repository.
+      if (!hintedParents.has(parent)) {
+        hintedParents.add(parent)
+        provider.event.emit('folderAdded', hint)
+      }
+    }
   }
 
   /**
@@ -204,14 +276,17 @@ class FileManager extends Plugin {
    * @param {string} data content to write on the file
    * @returns {void}
    */
-  async writeFile (path, data) {
+  async writeFile (path, data, mutationContext) {
+    let writeContext = mutationContext
     try {
+      this._assertNoWorkspaceRewrite('write files')
       path = this.limitPluginScope(path)
+      if (writeContext === undefined) writeContext = this._captureWorkspaceMutationContext(path)
       if (await this.exists(path)) {
         await this._handleIsFile(path, `Cannot write file ${path}`)
-        return await this.setFileContent(path, data)
+        return await this.setFileContent(path, data, writeContext)
       } else {
-        const ret = await this.setFileContent(path, data)
+        const ret = await this.setFileContent(path, data, writeContext)
         this.emit('fileAdded', path)
         return ret
       }
@@ -242,10 +317,13 @@ class FileManager extends Plugin {
    * @param {string} dest path of the destrination file
    * @returns {void}
    */
-  async copyFile (src, dest, customName) {
+  async copyFile (src, dest, customName, mutationContext) {
+    let writeContext = mutationContext
     try {
+      this._assertNoWorkspaceRewrite('copy files')
       src = this.limitPluginScope(src)
       dest = this.limitPluginScope(dest)
+      if (writeContext === undefined) writeContext = this._captureWorkspaceMutationContext(dest)
       await this._handleExists(src, `Cannot copy from ${src}. Path does not exist.`)
       await this._handleIsFile(src, `Cannot copy from ${src}. Path is not a file.`)
       await this._handleExists(dest, `Cannot paste content into ${dest}. Path does not exist.`)
@@ -254,7 +332,7 @@ class FileManager extends Plugin {
       let copiedFilePath = dest + (customName ? '/' + customName : '/' + `Copy_${helper.extractNameFromKey(src)}`)
       copiedFilePath = await helper.createNonClashingNameAsync(copiedFilePath, this)
 
-      await this.writeFile(copiedFilePath, content)
+      await this.writeFile(copiedFilePath, content, writeContext)
     } catch (e) {
       throw new Error(e)
     }
@@ -266,32 +344,35 @@ class FileManager extends Plugin {
    * @param {string} dest path of the destination dir
    * @returns {void}
    */
-  async copyDir (src, dest) {
+  async copyDir (src, dest, mutationContext) {
+    let writeContext = mutationContext
     try {
+      this._assertNoWorkspaceRewrite('copy folders')
       src = this.limitPluginScope(src)
       dest = this.limitPluginScope(dest)
+      if (writeContext === undefined) writeContext = this._captureWorkspaceMutationContext(dest)
       await this._handleExists(src, `Cannot copy from ${src}. Path does not exist.`)
       await this._handleIsDir(src, `Cannot copy from ${src}. Path is not a directory.`)
       await this._handleExists(dest, `Cannot paste content into ${dest}. Path does not exist.`)
       await this._handleIsDir(dest, `Cannot paste content into ${dest}. Path is not directory.`)
-      await this.inDepthCopy(src, dest)
+      await this.inDepthCopy(src, dest, 0, writeContext)
     } catch (e) {
       throw new Error(e)
     }
   }
 
-  async inDepthCopy (src, dest, count = 0) {
+  async inDepthCopy (src, dest, count = 0, mutationContext) {
     const content = await this.readdir(src)
     let copiedFolderPath = count === 0 ? dest + '/' + `Copy_${helper.extractNameFromKey(src)}` : dest + '/' + helper.extractNameFromKey(src)
     copiedFolderPath = await helper.createNonClashingDirNameAsync(copiedFolderPath, this)
 
-    await this.mkdir(copiedFolderPath)
+    await this.mkdir(copiedFolderPath, mutationContext)
 
     for (const [key, value] of Object.entries(content)) {
       if (!value.isDirectory) {
-        await this.copyFile(key, copiedFolderPath, helper.extractNameFromKey(key))
+        await this.copyFile(key, copiedFolderPath, helper.extractNameFromKey(key), mutationContext)
       } else {
-        await this.inDepthCopy(key, copiedFolderPath, count + 1)
+        await this.inDepthCopy(key, copiedFolderPath, count + 1, mutationContext)
       }
     }
   }
@@ -302,10 +383,13 @@ class FileManager extends Plugin {
    * @param {string} newPath new path of the file/directory
    * @returns {void}
    */
-  async rename (oldPath, newPath) {
+  async rename (oldPath, newPath, suppliedMutationContext) {
+    let mutationContext = suppliedMutationContext
     try {
+      this._assertNoWorkspaceRewrite('rename files')
       oldPath = this.limitPluginScope(oldPath)
       newPath = this.limitPluginScope(newPath)
+      if (mutationContext === undefined) mutationContext = this._captureWorkspaceMutationContext(oldPath)
       await this._handleExists(oldPath, `Cannot rename ${oldPath}`)
       const isFile = await this.isFile(oldPath)
       const newPathExists = await this.exists(newPath)
@@ -316,13 +400,13 @@ class FileManager extends Plugin {
           modalDialogCustom.alert('File already exists.')
           return
         }
-        return provider.rename(oldPath, newPath, false)
+        return provider.rename(oldPath, newPath, false, mutationContext)
       } else {
         if (newPathExists) {
           modalDialogCustom.alert('Folder already exists.')
           return
         }
-        return provider.rename(oldPath, newPath, true)
+        return provider.rename(oldPath, newPath, true, mutationContext)
       }
     } catch (e) {
       throw new Error(e)
@@ -334,15 +418,18 @@ class FileManager extends Plugin {
    * @param {string} path path of the new directory
    * @returns {void}
    */
-  async mkdir (path) {
+  async mkdir (path, mutationContext) {
+    let writeContext = mutationContext
     try {
+      this._assertNoWorkspaceRewrite('create folders')
       path = this.limitPluginScope(path)
+      if (writeContext === undefined) writeContext = this._captureWorkspaceMutationContext(path)
       if (await this.exists(path)) {
         throw createError({ code: 'EEXIST', message: `Cannot create directory ${path}` })
       }
       const provider = this.fileProviderOf(path)
 
-      return provider.createDir(path)
+      return provider.createDir(path, undefined, writeContext)
     } catch (e) {
       throw new Error(e)
     }
@@ -377,12 +464,15 @@ class FileManager extends Plugin {
    * @param {string} path path of the directory/file to remove
    * @returns {void}
    */
-  async remove (path) {
+  async remove (path, suppliedMutationContext) {
+    let mutationContext = suppliedMutationContext
     try {
+      this._assertNoWorkspaceRewrite('remove files')
       path = this.limitPluginScope(path)
+      if (mutationContext === undefined) mutationContext = this._captureWorkspaceMutationContext(path)
       await this._handleExists(path, `Cannot remove file or directory ${path}`)
       const provider = this.fileProviderOf(path)
-      return await provider.remove(path)
+      return await provider.remove(path, mutationContext)
     } catch (e) {
       throw new Error(e)
     }
@@ -509,10 +599,18 @@ class FileManager extends Plugin {
     })
   }
 
-  async setFileContent (path, content) {
+  async setFileContent (path, content, mutationContext) {
+    const writeContext = mutationContext === undefined ? this._captureWorkspaceMutationContext(path) : mutationContext
     if (this.currentRequest) {
       const canCall = await this.askUserPermission('writeFile', '')
-      if (canCall) {
+      // Derived build outputs (contracts/artifacts/*) are rewritten on EVERY
+      // compile the user just clicked — two "is modifying" toasts per compile
+      // is pure noise. Exempt the PATH class rather than one hardcoded writer
+      // name (was `from !== 'compilerMetadata'`): renaming that plugin or
+      // adding a second artifact writer must not resurrect the noise, and a
+      // plugin writing outside artifacts/ still notifies.
+      const isDerivedArtifactWrite = /(^|\/)artifacts\//.test(path)
+      if (canCall && !isDerivedArtifactWrite) {
         // inform the user about modification after permission is granted and even if permission was saved before
         // toaster(yo`
         //   <div>
@@ -554,32 +652,34 @@ class FileManager extends Plugin {
         )
       }
     }
-    return await this._setFileInternal(path, content)
+    return await this._setFileInternal(path, content, writeContext)
   }
 
-  _setFileInternal (path, content) {
+  _setFileInternal (path, content, mutationContext) {
+    const writeContext = mutationContext === undefined ? this._captureWorkspaceMutationContext(path) : mutationContext
     const provider = this.fileProviderOf(path)
     if (!provider) throw createError({ code: 'ENOENT', message: `${path} not available` })
     // TODO : Add permission
     // TODO : Change Provider to Promise
     return new Promise((resolve, reject) => {
       provider.set(path, content, (error) => {
-        if (error) reject(error)
+        if (error) return reject(error)
         this.syncEditor(path)
         this.emit('fileSaved', path)
         resolve(true)
-      })
+      }, writeContext)
     })
   }
 
   _saveAsCopy (path, content) {
     const fileProvider = this.fileProviderOf(path)
+    const mutationContext = this._captureWorkspaceMutationContext(path)
     if (fileProvider) {
       helper.createNonClashingNameWithPrefix(path, fileProvider, '', (error, copyName) => {
         if (error) {
           copyName = path + '.' + this.currentRequest.from
         }
-        this._setFileInternal(copyName, content)
+        this._setFileInternal(copyName, content, mutationContext)
         this.openFile(copyName)
       })
     }
@@ -594,7 +694,8 @@ class FileManager extends Plugin {
   }
 
   fileRemovedEvent (path) {
-    if (path === this._deps.config.get('currentFile')) {
+    const wasCurrent = path === this._deps.config.get('currentFile')
+    if (wasCurrent) {
       this._deps.config.set('currentFile', '')
     }
     this.editor.discard(path)
@@ -602,7 +703,7 @@ class FileManager extends Plugin {
     // TODO: Only keep `this.emit` (issue#2210)
     this.emit('fileRemoved', path)
     this.events.emit('fileRemoved', path)
-    this.openFile()
+    if (wasCurrent) this.openFile()
   }
 
   unselectCurrentFile () {
@@ -613,7 +714,12 @@ class FileManager extends Plugin {
     this.events.emit('noFileSelected')
   }
 
-  openFile (file) {
+  openFile (file, rewriteToken) {
+    // A Git checkout is about to replace files on disk. Keep the active editor
+    // session stable until its clean snapshot has been synced to the target
+    // branch; otherwise a newly opened old-branch tab can be written back over
+    // the checkout.
+    if (this._workspaceRewriteLock && file && this._workspaceRewriteLock.token !== rewriteToken) return Promise.resolve(false)
     const _openFile = (file) => {
       return new Promise((resolve) => {
         this.saveCurrentFile()
@@ -652,6 +758,7 @@ class FileManager extends Plugin {
   }
 
   openFileContent (file, content) {
+    if (this._workspaceRewriteLock) return false
     this.saveCurrentFile()
     const provider = this.fileProviderOf(file)
     if (!provider) {
@@ -737,6 +844,11 @@ class FileManager extends Plugin {
   }
 
   saveCurrentFile () {
+    // A debounce scheduled before checkout may fire while raw Git is replacing
+    // the worktree. Let the checked save inside the rewrite own persistence;
+    // otherwise the stale source-branch Ace buffer can be written back after
+    // checkout and silently undo the switch.
+    if (this._workspaceRewriteLock) return false
     var currentFile = this._deps.config.get('currentFile')
     if (currentFile && this.editor.current()) {
       var input = this.editor.get(currentFile)
@@ -752,33 +864,246 @@ class FileManager extends Plugin {
     }
   }
 
-  syncEditor (path) {
-    var currentFile = this._deps.config.get('currentFile')
-    if (path !== currentFile) return
+  saveCurrentFileChecked (rewriteToken) {
+    if (this._workspaceRewriteLock && this._workspaceRewriteLock.token !== rewriteToken) {
+      return Promise.reject(new Error('A Git workspace rewrite is already in progress. Save cancelled.'))
+    }
+    const currentFile = this._deps.config.get('currentFile')
+    if (!currentFile && !this.editor.current()) return Promise.resolve(true)
+    if (!currentFile || this.editor.current() !== currentFile) {
+      return Promise.reject(new Error('The active editor session is changing. Save cancelled.'))
+    }
 
-    var provider = this.fileProviderOf(currentFile)
-    if (provider) {
-      provider.get(currentFile, (error, content) => {
-        // A read failure used to fall through to setText(undefined), wiping the
-        // open editor to blank — and a subsequent save would then clobber the
-        // real file. Keep what's shown and surface the error instead.
-        if (error) return console.log(error)
-        this.editor.setText(content)
+    const input = this.editor.get(currentFile)
+    if (input === null || input === undefined) return Promise.resolve(true)
+
+    const provider = this.fileProviderOf(currentFile)
+    if (!provider) return Promise.reject(new Error(`Cannot save ${currentFile}. It does not belong to any explorer.`))
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let invoking = true
+      let promiseReturned = false
+      let callbackSucceeded = false
+      const fail = (error) => {
+        if (settled) return
+        settled = true
+        reject(error instanceof Error ? error : new Error(String(error || `Could not save ${currentFile}.`)))
+      }
+      const succeed = () => {
+        if (settled) return
+        try {
+          this.emit('fileSaved', currentFile)
+        } catch (error) {
+          return fail(error)
+        }
+        settled = true
+        resolve(true)
+      }
+      const callback = (error, result) => {
+        if (error || result === false) return fail(error || `Could not save ${currentFile}.`)
+        // Inspect a synchronous return value before accepting a synchronous
+        // success callback, and let a returned Promise remain authoritative.
+        if (invoking || promiseReturned) {
+          callbackSucceeded = true
+          return
+        }
+        succeed()
+      }
+
+      try {
+        // The workspace provider enforces the same rewrite token at the final
+        // synchronous BrowserFS mutation boundary. Other providers ignore the
+        // extra argument.
+        const returned = provider.set(currentFile, input, callback, rewriteToken)
+        invoking = false
+        promiseReturned = Boolean(returned && typeof returned.then === 'function')
+        if (returned === false) return fail(`Could not save ${currentFile}.`)
+        if (promiseReturned) {
+          returned.then((result) => {
+            if (result === false) return fail(`Could not save ${currentFile}.`)
+            succeed()
+          }).catch(fail)
+        } else if (callbackSucceeded || returned !== undefined || provider.set.length < 3) {
+          succeed()
+        }
+      } catch (error) {
+        invoking = false
+        fail(error)
+      }
+    })
+  }
+
+  beginWorkspaceRewrite (options = {}) {
+    if (this._workspaceRewriteLock) throw new Error('Another workspace rewrite is already in progress.')
+    if (this._workspaceMutationOwner !== null) throw new Error('A workspace change is already in progress. Retry the Git operation when it finishes.')
+    const token = ++this._workspaceRewriteToken
+    const notificationKey = `git-workspace-rewrite-${token}`
+    const warningAfterMs = Math.max(Number(options.warningAfterMs) || 65000, 10000)
+    const warningTimer = window.setTimeout(() => {
+      if (!this._workspaceRewriteLock || this._workspaceRewriteLock.token !== token) return
+      notification.error({
+        key: notificationKey,
+        message: 'Git workspace update is taking too long',
+        description: 'The editor remains protected because the underlying Git operation cannot be cancelled safely. Reload TronIDE to recover if it does not finish.',
+        duration: 0
       })
-    } else {
-      console.log('cannot save ' + currentFile + '. Does not belong to any explorer')
+    }, warningAfterMs)
+    // Install the provider-level guard in this same synchronous stack. It
+    // covers direct file-explorer uploads and async FileManager calls that
+    // passed their entry check before the checkout lock was acquired.
+    let providerGuarded
+    try { providerGuarded = this._deps.workspaceExplorer.beginGitWorkspaceRewrite(token) } catch (error) {
+      window.clearTimeout(warningTimer)
+      throw error
+    }
+    if (providerGuarded !== true) {
+      window.clearTimeout(warningTimer)
+      throw new Error('Could not protect workspace writes for the Git operation.')
+    }
+    try {
+      this._workspaceRewriteLock = { token, notificationKey, warningTimer }
+      if (this.editor.editor && typeof this.editor.editor.setReadOnly === 'function') this.editor.editor.setReadOnly(true)
+      return token
+    } catch (error) {
+      this._workspaceRewriteLock = null
+      this._deps.workspaceExplorer.endGitWorkspaceRewrite(token)
+      window.clearTimeout(warningTimer)
+      try {
+        const current = this.editor.current()
+        const readOnly = current ? Boolean(this.editor.readOnlySessions[current]) : true
+        if (this.editor.editor && typeof this.editor.editor.setReadOnly === 'function') this.editor.editor.setReadOnly(readOnly)
+      } catch (restoreError) {}
+      throw error
     }
   }
 
-  setBatchFiles (filesSet, fileProvider, override, callback) {
+  endWorkspaceRewrite (token) {
+    if (!this._workspaceRewriteLock || this._workspaceRewriteLock.token !== token) return false
+    // Do not make provider writes available until reconciliation has completed
+    // and the owner token is validated at both layers.
+    if (this._deps.workspaceExplorer.endGitWorkspaceRewrite(token) !== true) return false
+    const { warningTimer, notificationKey } = this._workspaceRewriteLock
+    window.clearTimeout(warningTimer)
+    // Some bundled Ant Design versions expose destroy(key), while older ones
+    // expose close(key). Notification cleanup must never strand the editor in
+    // its rewrite lock if one of those optional APIs is absent.
+    try {
+      if (typeof notification.destroy === 'function') notification.destroy(notificationKey)
+      else if (typeof notification.close === 'function') notification.close(notificationKey)
+    } catch (error) {}
+    this._workspaceRewriteLock = null
+    const current = this.editor.current()
+    const readOnly = current ? Boolean(this.editor.readOnlySessions[current]) : true
+    if (this.editor.editor && typeof this.editor.editor.setReadOnly === 'function') this.editor.editor.setReadOnly(readOnly)
+    return true
+  }
+
+  syncEditor (path) {
+    const currentFile = this._deps.config.get('currentFile')
+    if (path !== currentFile) return Promise.resolve(false)
+
+    const provider = this.fileProviderOf(currentFile)
+    if (!provider) {
+      const error = new Error('Cannot sync ' + currentFile + '. It does not belong to any explorer.')
+      console.log(error.message)
+      return Promise.resolve(false)
+    }
+
+    return new Promise((resolve, reject) => {
+      provider.get(currentFile, async (error, content) => {
+        try {
+          if (this._deps.config.get('currentFile') !== currentFile || this.editor.current() !== currentFile) return resolve(false)
+          if (error) {
+            console.log(error)
+            // During a rewrite this session was known saved and read-only.
+            // Close an unreadable stale tab so autosave cannot corrupt the
+            // target branch after the lock is released.
+            if (this._workspaceRewriteLock) this.fileRemovedEvent(currentFile)
+            return resolve(false)
+          }
+          if (content === null || content === undefined) {
+            // Raw git checkout does not emit provider fileRemoved events. Close
+            // the tab explicitly or its old buffer will recreate the file.
+            this.fileRemovedEvent(currentFile)
+            return resolve({ removed: true })
+          }
+          this.editor.setText(content)
+          resolve({ synced: true })
+        } catch (syncError) {
+          reject(syncError)
+        }
+      })
+    })
+  }
+
+  async reconcileOpenFilesAfterRewrite (rewriteToken) {
+    if (this._workspaceRewriteLock && this._workspaceRewriteLock.token !== rewriteToken) {
+      throw new Error('Only the active Git rewrite can reconcile editor sessions.')
+    }
+    // Raw Git operations bypass provider events. Remove every workspace tab
+    // whose target-branch file disappeared (including background tabs), then
+    // update the still-current session from the checked-out bytes.
+    const remaining = []
+    for (const openedPath of Object.keys(this.openedFiles)) {
+      const provider = this.fileProviderOf(openedPath)
+      if (provider !== this._deps.workspaceExplorer) {
+        remaining.push(openedPath)
+        continue
+      }
+      let exists = false
+      try { exists = await provider.exists(openedPath) } catch (e) { exists = false }
+      if (!exists) this.fileRemovedEvent(openedPath)
+      else remaining.push(openedPath)
+    }
+    let currentFile = this._deps.config.get('currentFile')
+    if (!currentFile) {
+      // Removing the active tab makes TabProxy select a remaining tab, but its
+      // normal open call is intentionally blocked by the rewrite lock. Open a
+      // known-existing fallback with the owner token so the visible active tab,
+      // config, and Ace session cannot diverge when the lock is released.
+      const fallback = remaining.find((openedPath) => this.openedFiles[openedPath])
+      if (!fallback) return { synced: false }
+      const opened = await this.openFile(fallback, rewriteToken)
+      if (!opened) throw new Error('Could not open a verified editor tab after the Git workspace update.')
+      return { synced: true, fallback }
+    }
+    try {
+      const result = await this.syncEditor(currentFile)
+      if (result === false) throw new Error('The active editor changed while Git was reconciling it.')
+      return result
+    } catch (error) {
+      // Never release the lock with an unsynchronised source-branch buffer. If
+      // updating Ace fails, discard that session and open another verified tab.
+      this.fileRemovedEvent(currentFile)
+      currentFile = this._deps.config.get('currentFile')
+      if (currentFile) {
+        const result = await this.syncEditor(currentFile)
+        if (result === false) throw new Error('Could not reconcile the replacement editor tab after the Git workspace update.')
+        return result
+      }
+      const fallback = remaining.find((openedPath) => this.openedFiles[openedPath])
+      if (!fallback) return { synced: false, discarded: true }
+      const opened = await this.openFile(fallback, rewriteToken)
+      if (!opened) throw new Error('Could not open a fallback editor tab after the Git workspace update.')
+      return { synced: true, fallback, discarded: true }
+    }
+  }
+
+  setBatchFiles (filesSet, fileProvider, override, callback, suppliedMutationContext) {
     const self = this
     if (!fileProvider) fileProvider = 'browser'
     if (override === undefined) override = false
+    const targetProvider = self._deps.filesProviders[fileProvider]
+    const mutationContext = suppliedMutationContext === undefined && targetProvider && typeof targetProvider.captureMutationContext === 'function'
+      ? targetProvider.captureMutationContext()
+      : suppliedMutationContext
 
     async.each(Object.keys(filesSet), (file, callback) => {
       if (override) {
         try {
-          self._deps.filesProviders[fileProvider].set(file, filesSet[file].content)
+          const accepted = targetProvider.set(file, filesSet[file].content, undefined, mutationContext)
+          if (accepted === false) return callback('Workspace changed before the files could be written.')
         } catch (e) {
           return callback(e.message || e)
         }
@@ -786,7 +1111,7 @@ class FileManager extends Plugin {
         return callback()
       }
 
-      helper.createNonClashingName(file, self._deps.filesProviders[fileProvider],
+      helper.createNonClashingName(file, targetProvider,
         (error, name) => {
           if (error) {
             modalDialogCustom.alert('Unexpected error loading the file ' + error)
@@ -794,7 +1119,8 @@ class FileManager extends Plugin {
             modalDialogCustom.alert('Special characters are not allowed')
           } else {
             try {
-              self._deps.filesProviders[fileProvider].set(name, filesSet[file].content)
+              const accepted = targetProvider.set(name, filesSet[file].content, undefined, mutationContext)
+              if (accepted === false) return callback('Workspace changed before the files could be written.')
             } catch (e) {
               return callback(e.message || e)
             }

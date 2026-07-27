@@ -24,6 +24,7 @@ var copyToClipboard = require('./copy-to-clipboard')
 // -------------- styling ----------------------
 var csjs = require('csjs-inject')
 var remixLib = require('@remix-project/remix-lib')
+var debuggerUI = require('@remix-ui/debugger-ui')
 
 var EventManager = require('../../lib/events')
 var helper = require('../../lib/helper')
@@ -212,7 +213,15 @@ class TxLogger {
 
 function debug (e, data, self) {
   e.stopPropagation()
-  if (data.tx.isCall && data.tx.envMode !== 'vm') {
+  const traceCapability = debuggerUI.debugTraceCapabilityForTransaction({
+    originProvider: data.tx.envMode,
+    currentProvider: self.blockchain && self.blockchain.getProvider ? self.blockchain.getProvider() : undefined,
+    network: (data.tx.pendingTransactionSnapshot && data.tx.pendingTransactionSnapshot.network) ||
+      (data.tx.runtimeSummary && data.tx.runtimeSummary.network)
+  })
+  if (!traceCapability.supported) {
+    modalDialog.alert(traceCapability.message)
+  } else if (data.tx.isCall && data.tx.envMode !== 'vm') {
     modalDialog.alert('Cannot debug this call. Debugging calls is only possible in JavaScript VM (Tron) mode.')
   } else {
     self.event.trigger('debuggingRequested', [data.tx.hash])

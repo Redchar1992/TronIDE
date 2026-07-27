@@ -27,7 +27,7 @@ import { extractTrc10Balance, parseBigIntValue, parseSafeInteger, TX_FIELD_LABEL
 
 const { createLegacyTx, createFeeMarket1559Tx } = require('@tvmjs/tx')
 const { createBlock } = require('@tvmjs/block')
-const { runBlock } = require('@tvmjs/vm')
+const { runBlock, createVM } = require('@tvmjs/vm')
 const createAddressFromString = (tvmjsUtil as any).createAddressFromString
 
 function parseVmInteger (rawValue, fieldName) {
@@ -167,23 +167,79 @@ export class TxRunnerVM {
 
       if (!useCall) {
         ++self.blockNumber
-        this.runBlockInVm(tx, block, callback)
+        this.runBlockInVm(this.getVMObject().vm, tx, block, callback)
       } else {
-        this.getVMObject().stateManager.checkpoint().then(() => {
-          this.runBlockInVm(tx, block, (err, result) => {
-            this.getVMObject().stateManager.revert().then(() => {
-              callback(err, result)
-            })
-          })
-        })
+        this.runCallInIsolatedVm(tx, block, callback)
       }
     }).catch((e) => {
       callback(e)
     })
   }
 
-  runBlockInVm (tx, block, callback) {
-    runBlock(this.getVMObject().vm, { block: block, generate: true, skipBlockValidation: true, skipBalance: false }).then((results) => {
+  /**
+   * Execute a read-only call against an ISOLATED SNAPSHOT of the committed
+   * state: a shallow-copied state manager (same backing store, own root
+   * pointer and checkpoint stack) bound to a throwaway VM.
+   *
+   * The previous implementation ran calls on the LIVE VM inside a
+   * stateManager.checkpoint()/revert() bracket. That bracket mutates the
+   * shared trie's checkpoint stack across many await points; it stays
+   * balanced only because the simulator's TxRunner queue serializes every
+   * RPC-driven execution. Any caller outside that queue (or a future code
+   * path emitting a state commit while a call is in flight) would have its
+   * committed state silently rolled back by the call's revert() — the
+   * DEF-VM-1 family of storage-drop bugs came from exactly this bracket.
+   * Running calls on a snapshot removes the hazard class: a read is
+   * structurally unable to move, tear, or roll back live state, whatever
+   * the interleaving. It also stops calls from clearing the live
+   * _storageTries cache on every revert().
+   *
+   * Trace events (beforeTx/afterTx/step) are forwarded from the throwaway VM
+   * to the live VM's emitters so the debugger/receipt bookkeeping
+   * (web3VmProvider) keeps recording calls exactly as before.
+   */
+  runCallInIsolatedVm (tx, block, callback) {
+    const vmObject = this.getVMObject()
+    const liveVm = vmObject.vm
+    let snapshotSM
+    try {
+      snapshotSM = vmObject.stateManager.shallowCopy()
+    } catch (e) {
+      return callback(e)
+    }
+    createVM({
+      common: this.commonContext,
+      activatePrecompiles: true,
+      stateManager: snapshotSM,
+      allowUnlimitedContractSize: true
+    }).then((callVm) => {
+      const forward = (fromEmitter, toEmitter, topic) => {
+        if (!fromEmitter || !toEmitter) return
+        fromEmitter.on(topic, (data, next) => {
+          const done = () => { if (typeof next === 'function') next() }
+          const listeners = typeof toEmitter.listeners === 'function' ? toEmitter.listeners(topic) : []
+          ;(async () => {
+            for (const listener of listeners) {
+              if (listener.length === 2) {
+                await new Promise((resolve) => listener(data, resolve))
+              } else {
+                listener(data)
+              }
+            }
+          })().then(done, done)
+        })
+      }
+      forward(callVm.events, liveVm.events || liveVm, 'beforeTx')
+      forward(callVm.events, liveVm.events || liveVm, 'afterTx')
+      forward(callVm.tvm && callVm.tvm.events, liveVm.tvm && liveVm.tvm.events, 'step')
+      this.runBlockInVm(callVm, tx, block, callback)
+    }).catch((err) => {
+      callback(err)
+    })
+  }
+
+  runBlockInVm (vm, tx, block, callback) {
+    runBlock(vm, { block: block, generate: true, skipBlockValidation: true, skipBalance: false }).then((results) => {
       const result = results.results[0]
       if (result) {
         const status = result.execResult.exceptionError ? 0 : 1

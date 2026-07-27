@@ -53,7 +53,7 @@ class Blockchain {
     }, _ => this.executionContext.web3(), _ => this.executionContext.currentblockGasLimit())
     this.txRunner = new TxRunner(web3Runner, { runAsync: true })
 
-    this.executionContext.event.register('contextChanged', this.resetEnvironment.bind(this))
+    this.executionContext.event.register('contextChanged', () => this.resetEnvironment({ preserveVmState: true }))
 
     this.networkcallid = 0
     this.networkStatus = { name: ' - ', id: ' - ' }
@@ -89,6 +89,27 @@ class Blockchain {
 
     this._refreshNetworkStatus()
 
+    // A provider/environment switch must refresh the status IMMEDIATELY: the
+    // pending-tx snapshot label is read from networkStatus, so the FIRST
+    // transaction sent right after switching to Injected otherwise compares
+    // the wallet's live network against the PREVIOUS provider's stale label
+    // and false-positives "Wallet network changed" (30s poll gap). Until the
+    // refresh completes the status is STALE — mark it, and the snapshot code
+    // below omits the network for that window (the facade only compares when
+    // both sides are known, matching its flaky-detection philosophy; the
+    // account check, the fund-critical one, always stays on).
+    this._networkSnapshotFresh = true
+    this.executionContext.event.register('contextChanged', () => {
+      this._networkSnapshotFresh = false
+      this.executionContext.invalidateNetworkDetectionCache()
+      const refreshed = this._refreshNetworkStatus()
+      if (refreshed && typeof refreshed.finally === 'function') {
+        refreshed.finally(() => { this._networkSnapshotFresh = true })
+      } else {
+        this._networkSnapshotFresh = true
+      }
+    })
+
     // WAL-NET-1: TronLink 4.9 gives no in-page event when the user switches
     // network in the wallet — but it does swap the provider's fullNode host.
     // Watch that synchronous string every second (no RPC) and refresh the
@@ -120,18 +141,30 @@ class Blockchain {
   // would otherwise reject the unawaited promise and surface in the runtime
   // error overlay as a phantom IDE P0. Swallow + log instead — a failed
   // background network refresh is benign.
+  // Resolves once networkStatus has been updated (or the detect failed), so the
+  // context-switch handler can flip _networkSnapshotFresh back on only when the
+  // status truly reflects the new provider — not a tick too early.
   _refreshNetworkStatus () {
-    try {
-      const ret = this.detectNetwork((error, network) => {
-        this.networkStatus = { network, error }
-        this.event.trigger('networkStatus', [this.networkStatus])
-      })
-      if (ret && typeof ret.catch === 'function') {
-        ret.catch((e) => console.warn('[blockchain] network status refresh failed:', e))
+    return new Promise((resolve) => {
+      let settled = false
+      const done = () => { if (!settled) { settled = true; resolve() } }
+      try {
+        const ret = this.detectNetwork((error, network) => {
+          this.networkStatus = { network, error }
+          this.event.trigger('networkStatus', [this.networkStatus])
+          done()
+        })
+        if (ret && typeof ret.catch === 'function') {
+          ret.catch((e) => { console.warn('[blockchain] network status refresh failed:', e); done() })
+        }
+        // detectNetwork's callback is normally async; guard against a provider
+        // that never calls back so the freshness flag can't latch off forever.
+        setTimeout(done, 8000)
+      } catch (e) {
+        console.warn('[blockchain] network status refresh failed:', e)
+        done()
       }
-    } catch (e) {
-      console.warn('[blockchain] network status refresh failed:', e)
-    }
+    })
   }
 
   getCurrentNetworkStatus () {
@@ -167,14 +200,18 @@ class Blockchain {
     })
   }
 
-  deployContractAndLibraries (selectedContract, args, contractMetadata, compilerContracts, callbacks, confirmationCb) {
+  // txMeta (optional): per-call overrides for the panel's value/TRC10 inputs —
+  // { value, tokenId, tokenValue } in SUN / raw token units. Programmatic
+  // callers (the AI tools) pass amounts here; UI flows omit it and keep
+  // reading the Deploy & Run fields. Libraries deploy value-less either way.
+  deployContractAndLibraries (selectedContract, args, contractMetadata, compilerContracts, callbacks, confirmationCb, txMeta) {
     const { continueCb, promptCb, statusCb, finalCb } = callbacks
     const constructor = selectedContract.getConstructorInterface()
     txFormat.buildData(selectedContract.name, selectedContract.object, compilerContracts, true, constructor, args, (error, data) => {
       if (error) return statusCb(`creation of ${selectedContract.name} errored: ` + error)
 
       statusCb(`creation of ${selectedContract.name} pending...`)
-      this.createContract(selectedContract, data, continueCb, promptCb, confirmationCb, finalCb)
+      this.createContract(selectedContract, data, continueCb, promptCb, confirmationCb, finalCb, txMeta)
     }, statusCb, (data, runTxCallback) => {
       // called for libraries deployment
       this.runTx(data, confirmationCb, continueCb, promptCb, runTxCallback)
@@ -192,14 +229,14 @@ class Blockchain {
     })
   }
 
-  createContract (selectedContract, data, continueCb, promptCb, confirmationCb, finalCb) {
+  createContract (selectedContract, data, continueCb, promptCb, confirmationCb, finalCb, txMeta) {
     if (data) {
       data.contractName = selectedContract.name
       data.linkReferences = selectedContract.bytecodeLinkReferences
       data.contractABI = selectedContract.abi
     }
 
-    this.runTx({ data: data, useCall: false }, confirmationCb, continueCb, promptCb,
+    this.runTx({ data: data, useCall: false, from: txMeta && txMeta.from, value: txMeta && txMeta.value, tokenId: txMeta && txMeta.tokenId, tokenValue: txMeta && txMeta.tokenValue }, confirmationCb, continueCb, promptCb,
       (error, txResult, address) => {
         if (error) {
           return finalCb(`creation of ${selectedContract.name} errored: ${(error.message ? error.message : error)}`)
@@ -352,7 +389,10 @@ class Blockchain {
     return execution.txIntegerUtils.extractTrc10Balance(account, tokenId)
   }
 
-  runOrCallContractMethod (contractName, contractAbi, funABI, contract, value, address, callType, lookupOnly, logMsg, logCallback, outputCb, confirmationCb, continueCb, promptCb) {
+  // txMeta (optional): { value, tokenId, tokenValue } — explicit amounts for
+  // this call (AI tools). UI flows omit it: value/TRC10 then come from the
+  // Deploy & Run panel fields as before.
+  runOrCallContractMethod (contractName, contractAbi, funABI, contract, value, address, callType, lookupOnly, logMsg, logCallback, outputCb, confirmationCb, continueCb, promptCb, txMeta) {
     // contractsDetails is used to resolve libraries
     txFormat.buildData(contractName, contractAbi, {}, false, funABI, callType, (error, data) => {
       if (error) {
@@ -371,7 +411,7 @@ class Blockchain {
         data.contract = contract
       }
       const useCall = funABI.stateMutability === 'view' || funABI.stateMutability === 'pure'
-      this.runTx({ to: address, data, useCall }, confirmationCb, continueCb, promptCb, (error, txResult, _address, returnValue) => {
+      this.runTx({ to: address, data, useCall, from: txMeta && txMeta.from, value: txMeta && txMeta.value, tokenId: txMeta && txMeta.tokenId, tokenValue: txMeta && txMeta.tokenValue }, confirmationCb, continueCb, promptCb, (error, txResult, _address, returnValue) => {
         if (error) {
           return logCallback(`${logMsg} errored: ${error} `)
         }
@@ -419,8 +459,11 @@ class Blockchain {
     })
   }
 
-  resetEnvironment () {
-    this.getCurrentProvider().resetEnvironment()
+  resetEnvironment ({ preserveVmState = false } = {}) {
+    const currentProvider = this.getCurrentProvider()
+    currentProvider.resetEnvironment({
+      preserveState: preserveVmState && currentProvider === this.providers.vm
+    })
     // TODO: most params here can be refactored away in txRunner
     const web3Runner = new TxRunnerWeb3({
       config: this.config,
@@ -563,6 +606,10 @@ class Blockchain {
 
         Object.assign(tx, extend)
         Object.assign(payLoad, extend)
+        // Explicit per-call TRC10 fields (AI tools) beat the panel's Extend
+        // Values inputs — `extend` was assigned above, so re-apply the args.
+        if (args.tokenId !== undefined && args.tokenId !== null) tx.tokenId = args.tokenId
+        if (args.tokenValue !== undefined && args.tokenValue !== null) tx.tokenValue = args.tokenValue
         const runtimeFacade = createRuntimeFacade({
           kind: 'tvm',
           environment: self.executionContext.isVM() ? 'vm' : 'injected',
@@ -584,9 +631,11 @@ class Blockchain {
         // nile/shasta/main alike, only the id differs (WAL-NET-1). It captures
         // what the UI displayed when the tx was initiated; txRunner compares it
         // against the wallet's live network before building and broadcasting.
-        const snapshotNetworkLabel = self.networkStatus?.network
-          ? [self.networkStatus.network.name, self.networkStatus.network.id].filter(Boolean).join('/')
-          : networkName
+        const snapshotNetworkLabel = self._networkSnapshotFresh === false
+          ? undefined // context just switched; the polled status is the OLD provider's
+          : (self.networkStatus?.network
+            ? [self.networkStatus.network.name, self.networkStatus.network.id].filter(Boolean).join('/')
+            : networkName)
         tx.runtimeSummary = runtimeFacade.createTransactionSummary({
           tokenId: tx.tokenId,
           tokenValue: tx.tokenValue,
@@ -609,7 +658,20 @@ class Blockchain {
         self.event.trigger('initiatingTransaction', [timestamp, tx, payLoad])
         self.txRunner.rawRun(tx, confirmationCb, continueCb, promptCb,
           async (error, result) => {
-            if (error) return next(error)
+            if (error) {
+              // TRON runners surface on-chain reverts and wallet rejections as
+              // ERRORS (txRunnerWeb3 rejects on txn.result === 'FAILED'), so a
+              // silent return here starves every 'transactionExecuted' listener
+              // of the outcome: the recorder could never stamp record.failed on
+              // the injected path (reverted steps exported as live TronBox
+              // migration code) and the AI write path waited its full timeout.
+              // Announce the failure for transactions; calls keep the old
+              // no-event behavior (their listeners never handled errors).
+              if (!tx.useCall) {
+                self.event.trigger('transactionExecuted', [error, tx.from, tx.to, tx.data, tx.useCall, result, timestamp, payLoad])
+              }
+              return next(error)
+            }
 
             const isVM = self.executionContext.isVM()
             if (isVM && tx.useCall) {

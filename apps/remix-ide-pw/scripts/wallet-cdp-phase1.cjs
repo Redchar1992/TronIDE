@@ -75,7 +75,7 @@ function startApprovePump (browser, active) {
     try {
       await page.waitForFunction(() => {
         const el = document.querySelector('[data-id="headerWalletConnect"]')
-        return el && /Wallet T/.test(el.textContent || '')
+        return el?.getAttribute('aria-haspopup') === 'menu'
       }, null, { timeout: 45000 })
     } catch (e) {
       const label = await headerBtn.getAttribute('title').catch(() => null)
@@ -99,10 +99,10 @@ function startApprovePump (browser, active) {
     log('runtab env:', envValue, '| net:', netText, '| account:', account0)
     await page.screenshot({ path: `${SHOTS}/02-connected.png`, fullPage: false })
 
-    check('TC-WAL-004 header', /Wallet T\w{3,6}…?\w*|Wallet T/.test(headerLabel) && /nile/i.test(headerLabel), `header="${headerLabel}"`)
+    check('TC-WAL-004 header', /T[A-Za-z0-9]{5}…[A-Za-z0-9]{6}\s·\sNile/i.test(headerLabel), `header="${headerLabel}"`)
     check('TC-WAL-004 runtab env', envValue === 'injected', `env=${envValue}`)
     check('TC-WAL-004 runtab net', /nile/i.test(netText), `net="${netText}"`)
-    const headerShort = (headerLabel.match(/Wallet (T\w{3,5})/) || [])[1]
+    const headerShort = (headerLabel.match(/(T[A-Za-z0-9]{5})…/) || [])[1]
     check('TC-IX-ENV-002 account sync', account0 && headerShort && account0.startsWith(headerShort.slice(0, 4)), `header=${headerShort} runtab=${account0}`)
 
     // Wallet menu read surfaces.
@@ -141,7 +141,7 @@ function startApprovePump (browser, active) {
     const pump2 = startApprovePump(browser, active2)
     await page.locator('[data-id="headerWalletConnect"]').click()
     try {
-      await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 30000 })
+      await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 30000 })
     } finally {
       active2.on = false
       await pump2

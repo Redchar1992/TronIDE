@@ -154,9 +154,17 @@ class FileProvider {
   }
 
   // this will not add a folder as readonly but keep the original url to be able to restore it later
-  addExternal (path, content, url) {
-    if (url) this.addNormalizedName(path, url)
-    return this.set(path, content)
+  addExternal (path, content, url, mutationContext) {
+    // Bind an asynchronously fetched dependency to the workspace/branch that
+    // requested it. WorkspaceFileProvider validates the context in `set` at
+    // the final synchronous BrowserFS mutation boundary; other providers
+    // simply ignore the extra argument.
+    const accepted = this.set(path, content, undefined, mutationContext)
+    // Do not leave a URL mapping behind when a stale workspace context rejects
+    // the write, otherwise a later lookup can point at a file that was never
+    // materialised in the active workspace.
+    if (accepted !== false && url) this.addNormalizedName(path, url)
+    return accepted
   }
 
   isReadOnly (path) {

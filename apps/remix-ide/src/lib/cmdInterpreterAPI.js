@@ -63,14 +63,31 @@ class CmdInterpreterAPI {
 
   loadurl (url, cb) {
     const self = this
+    let mutationContext
+    try {
+      // Bind the command before the top-level request and reuse this exact
+      // context for every metadata source fetched afterward. Late responses
+      // must fail closed instead of materialising in a newly selected branch.
+      mutationContext = self._deps.fileManager.captureWorkspaceMutationContext('/')
+    } catch (error) {
+      toolTip(`Unable to load ${url}: ${error.message || error}`)
+      if (cb) cb(error)
+      return
+    }
     self._components.fileImport.import(url,
       (loadingMsg) => { toolTip(loadingMsg) },
-      (err, content, cleanUrl, type, url) => {
+      async (err, content, cleanUrl, type, url) => {
         if (err) {
           toolTip(`Unable to load ${url}: ${err}`)
           if (cb) cb(err)
         } else {
-          self._deps.fileManager.writeFile(type + '/' + cleanUrl, content)
+          try {
+            await self._deps.fileManager.writeFile(type + '/' + cleanUrl, content, mutationContext)
+          } catch (error) {
+            toolTip(`Unable to load ${url}: ${error.message || error}`)
+            if (cb) cb(error)
+            return
+          }
           let parsed
           try {
             parsed = JSON.parse(content)
@@ -93,7 +110,7 @@ class CmdInterpreterAPI {
                   return callbackSource(`Cannot retrieve the content of ${url}: ${error}`)
                 } else {
                   try {
-                    await self._deps.fileManager.writeFile(type + '/' + cleanUrl, content)
+                    await self._deps.fileManager.writeFile(type + '/' + cleanUrl, content, mutationContext)
                     callbackSource()
                   } catch (e) {
                     callbackSource(e.message)

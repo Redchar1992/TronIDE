@@ -48,7 +48,7 @@ async function openAndConnect (ctx, browser) {
   await page.locator('[data-id="headerWalletConnect"]').waitFor({ timeout: 30000 })
   await page.locator('[data-id="headerWalletConnect"]').click()
   const ok = tapInPopup(browser, 'Connect', 5000) // in case TronLink re-prompts
-  await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 60000 })
+  await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 60000 })
   await ok
   return page
 }

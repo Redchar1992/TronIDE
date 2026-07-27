@@ -63,7 +63,7 @@ async function switchAccount (tl, name) {
     await page.locator('*[data-id="compiledContracts"]').waitFor({ timeout: 30000 })
 
     await page.locator('[data-id="headerWalletConnect"]').click()
-    await page.waitForFunction(() => /Wallet T/.test((document.querySelector('[data-id="headerWalletConnect"]') || {}).textContent || ''), null, { timeout: 90000 })
+    await page.waitForFunction(() => document.querySelector('[data-id="headerWalletConnect"]')?.getAttribute('aria-haspopup') === 'menu', null, { timeout: 90000 })
     const fromAccount = ((await page.locator('select[data-id="runTabSelectAccount"] option').first().textContent()) || '').trim()
     log('connected, deploying from:', fromAccount)
     await page.locator('#runTabView select[class^="contractNames"]').selectOption('Storage')

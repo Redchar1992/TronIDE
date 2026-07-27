@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test'
 import { dismissWelcomeModal } from './helpers'
 
-test.describe('GitHub token modal (audit 2026-05-27 regression)', () => {
-  test('Connect token modal does not offer "Remember in this browser" and shows tab-only storage notice', async ({ page }) => {
+test.describe('GitHub token modal (tab-session storage)', () => {
+  test('Connect token modal explains refresh-safe tab-only storage', async ({ page }) => {
     await page.goto('/')
     await dismissWelcomeModal(page)
 
@@ -22,9 +22,10 @@ test.describe('GitHub token modal (audit 2026-05-27 regression)', () => {
 
     await page.locator('[data-id="landingGithubTokenConnect"]').click()
 
-    // The modal text changed in 2026-05-27 from "Remember in this browser"
-    // to a tab-only-storage notice — assert both directions.
-    await expect(page.locator('text=Tokens stay in this browser tab only')).toBeVisible({ timeout: 5_000 })
+    // The connection is automatic for this tab; there is no persistent-storage
+    // checkbox that could accidentally promote it to localStorage.
+    await expect(page.locator('text=Tokens stay in this browser tab')).toBeVisible({ timeout: 5_000 })
+    await expect(page.locator('text=survive a refresh')).toBeVisible({ timeout: 5_000 })
     await expect(page.locator('#githubTokenRemember')).toHaveCount(0)
     await expect(page.locator('text=Remember in this browser')).toHaveCount(0)
   })

@@ -22,6 +22,7 @@ import * as remixDebug from '@remix-project/remix-debug'
 import { CompilationOutput, Sources } from '../idebugger-api'
 import type { CompilationResult } from '@remix-project/remix-solidity-ts'
 import { isMissingTxReceiptError, missingTxReceiptResponse } from './receipt-normalization'
+import { debugTraceCapabilityForProvider } from '../debug-trace-capability'
 const { TransactionDebugger: Debugger } = remixDebug
 
 export const DebuggerApiMixin = (Base) =>
@@ -122,6 +123,17 @@ export const DebuggerApiMixin = (Base) =>
       }
       remixDebug.init.extendWeb3(web3)
       return web3
+    }
+
+    async getDebugTraceCapability () {
+      try {
+        const provider = await this.call('network', 'getNetworkProvider')
+        return debugTraceCapabilityForProvider(provider)
+      } catch (e) {
+        // Standalone debugger hosts do not necessarily expose Remix's network
+        // plugin. Preserve their existing runtime trace probe in that case.
+        return debugTraceCapabilityForProvider()
+      }
     }
 
     async getTrace (hash) {

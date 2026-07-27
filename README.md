@@ -25,10 +25,11 @@ It is a platform for development tools that uses a plugin architecture, dedicate
 
 ### Core Features
 
-- **Full Contract Lifecycle Management**: Easily write, compile, deploy, debug, and test your Solidity smart contracts.
-- **Rich Plugin Ecosystem**: A plugin market with intuitive GUIs to extend your IDE's capabilities on demand.
-- **TRON Network Integration**: Optimized workflows for TRON, simplifying interaction with TronLink and the TRON network.
-- **AI Assistant (New!)**: Integrated AI assistance to help you debug code, optimize contract gas consumption, explain complex logic, and generate unit tests.
+- **Full Contract Lifecycle Management**: Write, compile, deploy, debug, and test Solidity smart contracts on a JavaScript VM (Tron), Injected TronWeb (TronLink), and TRON-focused examples.
+- **AI Assistant**: An in-panel assistant with a real IDE tool belt — it can compile and set the compiler version, deploy, read/write contracts, run tests and static analysis, search the workspace, show diffs and make precise edits, drive local Git (clone / commit / push / pull), record–replay–export a deploy flow as a runnable TronBox project, and save a compiler-settings reference for the manual TronScan verification workflow. Every file/state write asks for your confirmation first, and API keys are kept in browser memory only.
+- **TRON Network Integration**: Optimized workflows for TRON — connect TronLink, deploy and transact on Nile or Mainnet with clear wallet feedback, and TronScan-oriented contract verification.
+- **Local Git & GitHub**: A per-workspace Git panel (init, stage, commit, branches, history) plus in-browser clone / fetch / pull / push, with GitHub connected via an OAuth popup and tokens held in memory only.
+- **Rich Plugin Ecosystem**: A plugin architecture with intuitive GUIs to extend the IDE's capabilities on demand.
 
 ------
 
@@ -75,9 +76,17 @@ Getting TronIDE running on your local machine is straightforward.
     * Use Nile/testnet for validation; do not treat mainnet deployment as a release pass criterion.
     * Compile a sample Solidity contract, open Deploy & Run, connect TronLink on Nile, deploy, call a view method, send one state-changing transaction, and open the transaction on Tronscan.
 
-### v2.3.0 scope notes
+### v2.3.2 scope notes
 
-TronIDE v2.3.0 is TRON-oriented and does not claim full Ethereum Remix parity. Current Home status is documented in `apps/remix-ide/docs/v2.3.0-roadmap-section-3-traceability.md` and `apps/remix-ide/docs/remix-220-home-parity.md`: AI, tutorials, templates, plugin manager, static analysis, public GitHub links/imports, and the TronScan-oriented Contract Verification plugin exposes its actual local state; account sign-in is token-only for this release, GitHub OAuth is deferred while private read/write uses user-provided fine-grained tokens in the browser, and automated TronScan source submission/receipts plus EVM-only verification services remain blocked/unavailable or not applicable to TRON rather than marked done; AI model/audio/history controls are not duplicated on Home.
+TronIDE is TRON-oriented and does not claim full Ethereum Remix parity. Highlights of the current 2.3.x line:
+
+- **AI assistant** with a real IDE tool belt (compile / deploy / read–write, workspace search, diff and precise edits, tests, static analysis, local Git, Recorder → TronBox export, and verification), gated by per-write confirmation.
+- **Local Git panel** (init / stage / commit / branches / history) plus in-browser clone / fetch / pull / push.
+- **GitHub connect via an OAuth popup**, with tokens held in browser memory only — no GitHub secret is persisted to disk (the earlier Settings-tab gist token has been retired).
+- **Contract Verification** selects the deployable main contract and downloads a flattened `.sol` file for TronScan; the exported metadata JSON is a reference checklist only, and the final source upload stays manual.
+- **In-app Release Notes** (open them from the version badge or the Release Notes button in the header) and a **Feedback** entry that links straight to the project's GitHub issues.
+
+TronLink is the wallet path for real networks. Automated TronScan source submission/receipts and EVM-only verification services are unavailable or not applicable to TRON rather than marked as done.
 
 ------
 

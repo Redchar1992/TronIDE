@@ -103,6 +103,12 @@ export class CompileTab extends Plugin {
     if (!target) throw new Error('No target provided for compiliation')
     const provider = this.fileManager.fileProviderOf(target)
     if (!provider) throw new Error(`cannot compile ${target}. Does not belong to any explorer`)
+    // Clear stale editor annotations up front. runCompiler (the toolbar path)
+    // already does this, but a direct compileFile — the remix-plugin API and the
+    // AI panel's compile tool — did not, so a previous compile's error markers
+    // (e.g. a version-mismatch red on the pragma line) lingered after a later
+    // compile SUCCEEDED. Clearing here covers every compile entry point.
+    this.event.emit('removeAnnotations')
     return new Promise((resolve, reject) => {
       provider.get(target, (error, content) => {
         if (error) return reject(error)
