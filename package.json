@@ -410,8 +410,7 @@
       "js-cookie": "3.0.7",
       "nanoid": "3.3.11",
       "yaml": "1.10.3",
-      "brace-expansion": "1.1.16",
-      "minimatch@10.2.4>brace-expansion": "5.0.8",
+      "brace-expansion": "5.0.8",
       "protocol-buffers-schema": "3.6.1",
       "browserify-reload>chokidar": "3.6.0",
       "chokidar>anymatch": "3.1.3",
@@ -479,7 +478,7 @@
       "@babel/plugin-transform-modules-systemjs": "7.29.4",
       "fast-uri": "3.1.4",
       "bn.js": "5.2.3",
-      "postcss": "8.5.14",
+      "postcss": "8.5.18",
       "ip-address": "10.2.0",
       "webpack": "5.104.1",
       "@tvmjs/binarytree": "^1.0.0",
@@ -498,6 +497,9 @@
       "websocket-driver": "0.7.5",
       "webpack-dev-server": "5.2.6",
       "@cypress/request": "3.0.10"
+    },
+    "patchedDependencies": {
+      "minimatch@3.1.4": "patches/minimatch@3.1.4.patch"
     }
   },
   "packageManager": "pnpm@10.12.4"
