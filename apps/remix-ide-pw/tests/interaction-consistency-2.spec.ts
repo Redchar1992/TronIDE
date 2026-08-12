@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test'
-import { dismissWelcomeModal } from './helpers'
+import { dismissWelcomeModal, seedGithubBffSession } from './helpers'
 
 // Remaining R-IX cases from 交互回归测试计划.md: cross-path state consistency for
 // workspaces (S2), current file (S3), panel layout (S5), Home collapsibles (S6)
@@ -199,11 +199,7 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
     await expect(page.locator('select[data-id="workspacesSelect"]')).toHaveValue('ix-layout-ws')
   })
 
-  test('TC-IX-HOME-002: GitHub token Connect/Disconnect text strictly tracks the real state', async ({ page }) => {
-    // Validate against a mocked GitHub /user so no real token is needed; the
-    // panel state (not the network) is under test.
-    await page.route('https://api.github.com/user', (route) =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ login: 'tron-tester' }) }))
+  test('TC-IX-HOME-002: GitHub BFF Connect/Disconnect text strictly tracks the real state', async ({ page }) => {
     await bootstrap(page)
 
     // Expand Advanced Tools so the GitHub Token panel is visible.
@@ -212,32 +208,28 @@ test.describe('Interaction consistency II (R-IX remainder)', () => {
     const panel = page.locator('[data-id="landingGithubTokenPanel"]')
     await expect(panel).toBeVisible({ timeout: 10_000 })
 
-    // Disconnected baseline: Connect reads "Connect token", no Disconnect button.
-    const connectBtn = page.locator('[data-id="landingGithubTokenConnect"]')
-    await expect(connectBtn).toHaveText('Connect token (PAT)')
+    // Disconnected baseline: OAuth connect is available, no Disconnect button.
+    const connectBtn = page.locator('[data-id="landingGithubOAuthConnect"]')
+    await expect(connectBtn).toHaveText('Connect to GitHub')
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toHaveCount(0)
 
-    // Connect: enter a (mock-validated) token.
-    await connectBtn.click()
-    const tokenInput = page.locator('[data-id="modalDialogCustomPromptText"]')
-    await tokenInput.waitFor({ state: 'visible', timeout: 10_000 })
-    await tokenInput.fill('ghp_faketoken_for_test')
-    await page.locator('#modal-footer-ok').click()
+    // Seed a deterministic opaque BFF session; no GitHub credential is used.
+    await seedGithubBffSession(page)
+    if ((await advToggle.getAttribute('aria-expanded')) === 'false') await advToggle.click()
 
-    // Connected: Disconnect appears, Connect flips to "Reconnect token", the
-    // login surfaces. The token is scoped to this browser tab so a refresh keeps
-    // the connection without creating a persistent localStorage copy.
+    // Connected: Disconnect appears and the verified login surfaces.
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toBeVisible({ timeout: 10_000 })
-    await expect(connectBtn).toHaveText('Reconnect token')
+    await expect(connectBtn).toHaveText('Reconnect GitHub')
     await expect(panel).toContainText('tron-tester')
-    expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.token'))).toBe('ghp_faketoken_for_test')
+    expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.session'))).toContain('test_bff_session')
+    expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.token'))).toBeNull()
     expect(await page.evaluate(() => window.localStorage.getItem('tronide.github.token'))).toBeNull()
 
-    // Disconnect: state reverts exactly — Disconnect gone, Connect back to
-    // "Connect token" (M2: text == state). Disconnect clears the tab copy.
+    // Disconnect revokes the BFF session and restores the exact baseline.
     await page.locator('[data-id="landingGithubTokenDisconnect"]').click()
     await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toHaveCount(0, { timeout: 10_000 })
-    await expect(connectBtn).toHaveText('Connect token (PAT)')
+    await expect(connectBtn).toHaveText('Connect to GitHub')
+    expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.session'))).toBeNull()
     expect(await page.evaluate(() => window.sessionStorage.getItem('tronide.github.token'))).toBeNull()
   })
 

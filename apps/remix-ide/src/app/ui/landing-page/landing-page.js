@@ -25,6 +25,7 @@ import { workspace } from '@remix-project/remix-lib'
 import JSZip from 'jszip'
 import { connectWithGithubOAuth } from '../../../lib/github-oauth'
 import * as githubAuth from '../../../lib/github-auth'
+import { githubRequest as githubBffRequest, revokeSession } from '../../../lib/github-bff'
 import { disconnectGithub } from '../../../lib/github-connection'
 
 const yo = require('yo-yo')
@@ -1457,20 +1458,13 @@ export class LandingPage extends ViewPlugin {
       open: false,
       items: readJsonStorage('tronide.home.notifications', []).slice(0, 8)
     }
-    // GitHub tokens live in this tab's session (lib/github-auth): a refresh keeps
-    // the connection, while closing the tab clears it. Never promote the token
-    // to localStorage/config. Defensive: scrub only the historical persistent
-    // copies left by older versions.
+    // Only the opaque, origin-bound BFF session lives in this tab. GitHub's
+    // access token stays encrypted server-side and is never written by the UI.
+    // Defensive: scrub historical browser token copies from older versions.
     try { window.localStorage.removeItem('tronide.github.token') } catch (error) { console.debug('[home] failed to clear legacy github token', error) }
     try { window.localStorage.removeItem('tronide.github.user') } catch (error) { console.debug('[home] failed to clear legacy github user', error) }
-    // `githubTokenState` is a render-side mirror of the tab-session store; the
-    // authoritative copy is githubAuth.getToken()/getLogin().
-    const githubTokenState = {
-      get token () { return githubAuth.getToken() },
-      // live like `token` — a snapshot here went stale the moment the login
-      // changed through another surface (header connect/disconnect). Existing
-      // call sites assign the /user API object; forward that to the store so
-      // every consumer (header included) sees it via the changed event.
+    const githubSessionState = {
+      get connected () { return githubAuth.isConnected() },
       get user () { return githubAuth.getLogin() ? { login: githubAuth.getLogin() } : null },
       set user (value) { githubAuth.setLogin(value && value.login ? value.login : '') }
     }
@@ -1517,14 +1511,8 @@ export class LandingPage extends ViewPlugin {
       return detail ? `GitHub ${status}: ${detail}` : `GitHub request failed (${status || 'network error'})`
     }
     const githubRequest = async (path, options = {}) => {
-      if (!githubTokenState.token) throw new Error('Connect a GitHub token first.')
-      const response = await window.fetch(`https://api.github.com${path}`, Object.assign({
-        headers: Object.assign({
-          Authorization: `Bearer ${githubTokenState.token}`,
-          Accept: 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28'
-        }, options.headers || {})
-      }, options))
+      if (!githubSessionState.connected) throw new Error('Connect GitHub first.')
+      const response = await githubBffRequest(path, options)
       const text = await response.text()
       let payload = {}
       try {
@@ -1539,70 +1527,36 @@ export class LandingPage extends ViewPlugin {
       }
       return payload
     }
-    const saveGithubToken = (token) => {
-      // github-auth owns the tab-scoped sessionStorage mirror. Every reader
-      // (gist publish/load, header, dgitProvider) still goes through getToken(),
-      // and no persistent localStorage/config copy is written.
-      githubAuth.setToken(token, githubAuth.getLogin())
-    }
-    // Update the connected GitHub login in the tab-session store; setLogin (like
-    // setToken/clearToken) dispatches 'tronideGithubConnectionChanged' so the
-    // header and any other live consumer update immediately.
-    const persistGithubUser = (login) => {
-      githubAuth.setLogin(login)
-    }
-    const clearGithubToken = (silent = false) => {
-      // Full disconnect (tab-session token + legacy web storage + the config-backed
-      // Settings gist token). Shared with the header GitHub menu via
-      // lib/github-connection so the two disconnect paths cannot diverge.
+    const clearGithubSession = (silent = false) => {
       disconnectGithub()
-      if (!silent) addNotification('GitHub disconnected', 'GitHub token was cleared from this browser tab.')
+      if (!silent) addNotification('GitHub disconnected', 'The TronIDE GitHub session was revoked.')
       refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel)
     }
-    const connectGithubToken = () => {
-      const message = yo`
-        <div>
-          <div>Paste a fine-grained GitHub token — or skip this and use Connect GitHub in the header to sign in with OAuth instead.</div>
-          <div class=${css.securityNote}>Tokens stay in this browser tab, survive a refresh, and are cleared when you close it. Recommended scopes: Contents read for import; Contents read/write only when committing. Limit the token to selected repositories.</div>
-        </div>
-      `
-      modalDialogCustom.promptPassphrase('Connect GitHub Token', message, '', async (token) => {
-        if (!token) return
-        // The prompt closes on save and token validation is async (a network
-        // round-trip to api.github.com), so without immediate + persistent
-        // feedback the gap and the transient tooltip read as "save did nothing".
-        tooltip('Validating GitHub token…')
-        try {
-          saveGithubToken(token)
-          githubTokenState.user = await githubRequest('/user')
-          const login = (githubTokenState.user && githubTokenState.user.login) || 'Token validated.'
-          addNotification('GitHub connected', login)
-          refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel)
-          tooltip(`GitHub connected as ${login}`)
-          persistGithubUser(githubTokenState.user && githubTokenState.user.login)
-        } catch (error) {
-          clearGithubToken(true)
-          const msg = error.message || 'GitHub token rejected.'
-          addNotification('GitHub connection failed', msg, 'error')
-          tooltip(msg)
-        }
-      }, null, true)
-    }
-    // OAuth popup connect — no PAT pasting. Reuses the same token sinks as the
-    // PAT path (saveGithubToken mirrors the gist token; persistGithubUser syncs
-    // the header), so gist + Git-panel keep working unchanged.
+    // The popup returns an opaque TronIDE session, never a GitHub token.
     const connectGithubOAuth = async () => {
-      tooltip('Opening GitHub authorization…')
+      tooltip('Opening GitHub…')
+      const previousSession = githubAuth.getSession()
+      const previousLogin = githubAuth.getLogin()
       try {
-        const { token, login } = await connectWithGithubOAuth()
-        saveGithubToken(token)
-        githubTokenState.user = login ? { login } : await githubRequest('/user')
-        const name = (githubTokenState.user && githubTokenState.user.login) || 'Connected.'
+        const { session, login } = await connectWithGithubOAuth()
+        githubAuth.setSession(session, login)
+        if (previousSession && previousSession !== session) {
+          revokeSession(previousSession).catch((error) => console.debug('[home] previous GitHub session revocation failed', error))
+        }
+        githubSessionState.user = { login }
+        const name = (githubSessionState.user && githubSessionState.user.login) || 'Connected.'
         addNotification('GitHub connected', name)
         refreshHomeSection('landingGithubTokenPanel', renderGithubTokenPanel)
         tooltip(`GitHub connected as ${name}`)
-        persistGithubUser(githubTokenState.user && githubTokenState.user.login)
       } catch (error) {
+        // A cancelled/failed reconnect must not destroy the still-valid old
+        // session. Only roll back if a replacement session was already stored.
+        const failedReplacement = githubAuth.getSession()
+        if (failedReplacement && failedReplacement !== previousSession) {
+          githubAuth.clearSession()
+          revokeSession(failedReplacement).catch((revokeError) => console.debug('[home] failed GitHub replacement session revocation failed', revokeError))
+          if (previousSession) githubAuth.setSession(previousSession, previousLogin)
+        }
         const msg = (error && error.message) || 'GitHub authorization failed.'
         addNotification('GitHub connection failed', msg, 'error')
         tooltip(msg)
@@ -1637,14 +1591,13 @@ export class LandingPage extends ViewPlugin {
         }
       })
     }
-    const copyGithubTokenChecklist = async () => {
+    const copyGithubConnectionChecklist = async () => {
       const checklist = [
-        'TronIDE GitHub Token checklist',
-        '- Use a fine-grained personal access token.',
-        '- Scope read access for import; add contents read/write only for commits.',
-        '- Limit the token to selected repositories.',
-        '- Prefer session storage on shared devices.',
-        '- Revoke the token from GitHub settings if the browser is untrusted.'
+        'TronIDE GitHub connection checklist',
+        '- Confirm the account shown by GitHub before authorizing.',
+        '- Grant organization access only when the repository requires it.',
+        '- Disconnect TronIDE when using a shared browser.',
+        '- Revoke TronIDE from GitHub settings if the browser is untrusted.'
       ].join('\n')
       // clipboard.writeText returns a PROMISE that rejects asynchronously
       // (blocked permission / insecure context) — the old sync try/catch never
@@ -1652,8 +1605,8 @@ export class LandingPage extends ViewPlugin {
       // click looked like nothing happened. Await it and always show a toast.
       try {
         await window.navigator.clipboard.writeText(checklist)
-        addNotification('GitHub checklist copied', 'Token permission checklist copied to clipboard.', 'github')
-        tooltip('GitHub token checklist copied to clipboard.')
+        addNotification('GitHub checklist copied', 'Connection checklist copied to clipboard.', 'github')
+        tooltip('GitHub connection checklist copied to clipboard.')
       } catch (error) {
         // Clipboard unavailable — show the checklist itself so the user still gets it.
         tooltip(checklist)
@@ -2026,7 +1979,7 @@ export class LandingPage extends ViewPlugin {
         ['TronLink readiness', 'Check injection, account, and Nile/Shasta/Mainnet host before deployment.', checkTronLinkReadiness, 'landingRecipeTronLink'],
         ['Nile deploy checklist', 'Compile, switch TronLink to Nile, set feeLimit, deploy, then verify on TronScan.', startInjectedTronWeb, 'landingRecipeNileDeploy'],
         ['Contract verification', 'Compile, select the deployed main contract, download its flattened .sol, then upload it on TronScan.', openContractVerification, 'landingRecipeVerification'],
-        ['GitHub token safety', 'Copy the recommended token permission checklist before using private read/write.', copyGithubTokenChecklist, 'landingRecipeGithubToken']
+        ['GitHub connection safety', 'Copy account and shared-browser safety checks.', copyGithubConnectionChecklist, 'landingRecipeGithubToken']
       ]
       return yo`
         <section class=${css.panel} data-id="landingCookbookPanel">
@@ -2049,17 +2002,16 @@ export class LandingPage extends ViewPlugin {
     const renderGithubTokenPanel = () => yo`
       <section class=${css.panel} data-id="landingGithubTokenPanel">
         <div class=${css.panelHead}>
-          <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>${githubIcon}</span> GitHub Token</h3>
-          <span class=${css.panelMore} title=${githubTokenState.user && githubTokenState.user.login ? `Connected as ${githubTokenState.user.login}` : 'No token set yet. Tokens are kept for this browser session only (not saved to disk).'}>${githubTokenState.user && githubTokenState.user.login ? githubTokenState.user.login : 'Not connected'}</span>
+          <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>${githubIcon}</span> GitHub access</h3>
+          <span class=${css.panelMore} title=${githubSessionState.user && githubSessionState.user.login ? `Connected as ${githubSessionState.user.login}` : 'Not connected. GitHub credentials remain encrypted in the TronIDE BFF.'}>${githubSessionState.user && githubSessionState.user.login ? githubSessionState.user.login : 'Not connected'}</span>
         </div>
-        <div class=${css.securityNote}>Use a fine-grained PAT with the <b>Contents</b> permission for repo import/push. The token stays in this tab, survives refresh, and is never written to persistent browser storage — use trusted devices only.</div>
+        <div class=${css.securityNote}>GitHub authorization is handled by the TronIDE BFF. This browser receives only a revocable TronIDE session; it never receives or stores the GitHub access token.</div>
         <div class=${css.loadChips}>
-          <button class=${css.loadChip} data-id="landingGithubOAuthConnect" onclick=${() => connectGithubOAuth()}>${githubTokenState.token ? 'Reconnect GitHub' : 'Connect to GitHub'}</button>
-          <button class=${css.loadChip} data-id="landingGithubTokenConnect" onclick=${() => connectGithubToken()}>${githubTokenState.token ? 'Reconnect token' : 'Connect token (PAT)'}</button>
+          <button class=${css.loadChip} data-id="landingGithubOAuthConnect" onclick=${() => connectGithubOAuth()}>${githubSessionState.connected ? 'Reconnect GitHub' : 'Connect to GitHub'}</button>
           <button class=${css.loadChip} data-id="landingGithubTokenImport" onclick=${() => importGithubFileWithToken()}>Import private file</button>
           <button class=${css.loadChip} data-id="landingGithubTokenCommit" onclick=${() => commitCurrentFileToGithub()}>Commit current file</button>
-          <button class=${css.loadChip} data-id="landingGithubTokenChecklist" onclick=${() => copyGithubTokenChecklist()}>Copy token checklist</button>
-          ${githubTokenState.token ? yo`<button class=${css.loadChip} data-id="landingGithubTokenDisconnect" onclick=${() => clearGithubToken()}>Disconnect</button>` : ''}
+          <button class=${css.loadChip} data-id="landingGithubTokenChecklist" onclick=${() => copyGithubConnectionChecklist()}>Copy safety checklist</button>
+          ${githubSessionState.connected ? yo`<button class=${css.loadChip} data-id="landingGithubTokenDisconnect" onclick=${() => clearGithubSession()}>Disconnect</button>` : ''}
         </div>
       </section>
     `

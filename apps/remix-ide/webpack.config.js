@@ -169,6 +169,9 @@ module.exports = config => {
     // unless a global `BROWSER` is defined, in which case it uses the bundled
     // tokens. Define it so the parser works in the browser (in-editor linter).
     BROWSER: JSON.stringify(true),
+    // Public team-owned Deno BFF origin. Keep overridable so test and
+    // production can cut over independently without editing application code.
+    'process.env.TRONIDE_GITHUB_BFF_ORIGIN': JSON.stringify(process.env.TRONIDE_GITHUB_BFF_ORIGIN || 'https://tronide-gh-oauth.redchar1992.deno.net'),
     'process.env.TRON_PUBLIC_TRONGRID_API_KEY': JSON.stringify(process.env.TRON_PUBLIC_TRONGRID_API_KEY || ''),
     'process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS || ''),
     'process.env.TRONSCAN_NILE_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_NILE_CONTRACT_API_URLS || ''),

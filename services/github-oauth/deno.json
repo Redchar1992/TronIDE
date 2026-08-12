@@ -2,6 +2,7 @@
   "tasks": {
     "dev": "deno run --unstable --allow-net --allow-env --allow-read --allow-write --watch main.ts",
     "test": "deno test --unstable --allow-env main_test.ts",
+    "check": "deno fmt --check main.ts main_test.ts && deno check --unstable main.ts main_test.ts",
     "deploy": "deployctl deploy --project=tronide-gh-oauth main.ts"
   }
 }

@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test'
-import { dismissWelcomeModal } from './helpers'
+import { dismissWelcomeModal, seedGithubBffSession } from './helpers'
 
 // TC-GIT-R1/R2/R3 (v2.3.2 remote-git): the Git panel exposes Clone (into a new
 // workspace) + Add-remote + Push/Pull against a GitHub remote, routed through
@@ -22,14 +22,10 @@ async function openGitPanel (page: Page) {
   await page.locator('[data-id="gitPanel"]').waitFor({ state: 'visible', timeout: 15_000 })
 }
 
-async function connectFakeGithubToken (page: Page) {
+async function connectFakeGithubSession (page: Page) {
+  await seedGithubBffSession(page, 'force-push-tester')
   const advanced = page.locator('[data-id="landingAdvancedToolsToggle"]')
   if ((await advanced.getAttribute('aria-expanded')) === 'false') await advanced.click()
-  await page.locator('[data-id="landingGithubTokenConnect"]').click()
-  const tokenInput = page.locator('[data-id="modalDialogCustomPromptText"]')
-  await tokenInput.waitFor({ state: 'visible', timeout: 10_000 })
-  await tokenInput.fill('ghp_force_push_confirmation_test')
-  await page.locator('#modal-footer-ok').click()
   await expect(page.locator('[data-id="landingGithubTokenDisconnect"]')).toBeVisible({ timeout: 10_000 })
 }
 
@@ -73,14 +69,8 @@ test.describe('Git panel (remote)', () => {
   })
 
   test('TC-GIT-R7: force push requires confirmation; cancel blocks it and normal push remains direct', { tag: '@gate' }, async ({ page }) => {
-    await page.route('https://api.github.com/user', (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ login: 'force-push-tester' })
-      }))
     await openHome(page)
-    await connectFakeGithubToken(page)
+    await connectFakeGithubSession(page)
     await openGitPanel(page)
 
     const init = page.locator('[data-id="gitInit"]')

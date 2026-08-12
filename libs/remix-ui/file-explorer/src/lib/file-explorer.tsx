@@ -22,7 +22,6 @@ import React, { useEffect, useState, useRef, useReducer } from 'react'; // eslin
 import { TreeView, TreeViewItem } from '@remix-ui/tree-view'; // eslint-disable-line
 import { ModalDialog } from '@remix-ui/modal-dialog'; // eslint-disable-line
 import { Toaster } from '@remix-ui/toaster'; // eslint-disable-line
-import Gists from 'gists'
 import { FileExplorerMenu } from './file-explorer-menu'; // eslint-disable-line
 import { FileExplorerContextMenu } from './file-explorer-context-menu'; // eslint-disable-line
 import { FileExplorerProps, File, MenuItems } from './types'
@@ -40,6 +39,7 @@ import {
 import * as helper from '../../../../../apps/remix-ide/src/lib/helper'
 import QueryParams from '../../../../../apps/remix-ide/src/lib/query-params'
 import * as githubAuth from '../../../../../apps/remix-ide/src/lib/github-auth'
+import { githubRequest } from '../../../../../apps/remix-ide/src/lib/github-bff'
 import { customAction } from '@remixproject/plugin-api'
 
 import './css/file-explorer.css'
@@ -865,16 +865,12 @@ export const FileExplorer = (props: FileExplorerProps) => {
      * This function is to get the original content of given gist
      * @params id is the gist id to fetch
      */
-    const getOriginalFiles = async (id, accessToken?) => {
+    const getOriginalFiles = async (id) => {
       if (!id) {
         return []
       }
 
-      const url = `https://api.github.com/gists/${id}`
-      // Authenticate with the configured gist token so this update-path read shares the higher
-      // GitHub rate limit (anonymous reads were hitting "API rate limit exceeded"). The caller
-      // only reaches here once a token is present, but stay safe if it is ever called without one.
-      const res = await fetch(url, accessToken ? { headers: { Authorization: `token ${accessToken}` } } : undefined)
+      const res = await githubRequest(`/gists/${id}`)
       // A 404 (gist does not exist) or 401/403 (no permission) still returns a JSON body, but it is a
       // GitHub *error* object with no `files` key. Parsing it and falling back to `data.files || []`
       // silently yields `[]`, which the update flow then treats as a successful empty read and the
@@ -900,12 +896,9 @@ export const FileExplorer = (props: FileExplorerProps) => {
           async () => {}
         )
       } else {
-        // Publishing needs the in-memory GitHub connect token (lib/github-auth, set
-        // by the Home/Header "Connect GitHub" flow). The legacy Settings-tab PAT
-        // channel is retired — tokens are tab-scoped and never read from config.
-        const accessToken = (githubAuth.getToken() || '').trim()
-
-        if (!accessToken) {
+        // Publishing is authenticated by the opaque BFF session. GitHub's token
+        // is never available to this component or the gists payload.
+        if (!githubAuth.isConnected()) {
           modal(
             'Connect GitHub',
             'Publishing a gist needs a GitHub connection that can create gists. Use "Connect GitHub" on the Home page (or the header button) to sign in, then publish again.',
@@ -921,11 +914,9 @@ export const FileExplorer = (props: FileExplorerProps) => {
             '&runs=' +
             queryParams.get().runs +
             '&gist='
-          const gists = new Gists({ token: accessToken })
-
           if (id) {
             try {
-              const originalFileList = await getOriginalFiles(id, accessToken)
+              const originalFileList = await getOriginalFiles(id)
               // Telling the GIST API to remove files
               const updatedFileList = Object.keys(packaged)
               const allItems = Object.keys(originalFileList)
@@ -945,18 +936,21 @@ export const FileExplorer = (props: FileExplorerProps) => {
               })
 
               toast('Saving gist (' + id + ') ...')
-              await gists.edit(id,
-                {
+              const response = await githubRequest(`/gists/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
                   description: description,
                   public: true,
                   files: allItems
-                }
-              ).then((result) => {
-                proccedResult(null, result.body)
-                for (const key in allItems) {
-                  if (allItems[key] === null) delete allItems[key]
-                }
+                })
               })
+              const result = await response.json()
+              if (!response.ok) throw Object.assign(new Error(result.message || `GitHub gist update failed (${response.status})`), { status: response.status, body: result })
+              proccedResult(null, result)
+              for (const key in allItems) {
+                if (allItems[key] === null) delete allItems[key]
+              }
             } catch (error) {
               // Clear the "Saving gist..." toast so it does not linger next to the error modal,
               // then surface a clear failure (e.g. the gist id does not exist or token lacks access)
@@ -967,14 +961,18 @@ export const FileExplorer = (props: FileExplorerProps) => {
           } else {
             // id is not existing, need to create a new gist
             toast('Creating a new gist ...')
-            gists.create(
-              {
+            githubRequest('/gists', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
                 description: description,
                 public: true,
                 files: packaged
-              }
-            ).then(result => {
-              proccedResult(null, result.body)
+              })
+            }).then(async response => {
+              const result = await response.json()
+              if (!response.ok) throw Object.assign(new Error(result.message || `GitHub gist creation failed (${response.status})`), { status: response.status, body: result })
+              proccedResult(null, result)
             }).catch(error => {
               // Clear the "Creating a new gist..." toast first so it does not linger
               // behind the error modal (avoids a stacked toast + modal).

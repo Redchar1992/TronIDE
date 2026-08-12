@@ -62,6 +62,7 @@ jobs:
       - name: Build
         env:
           NODE_OPTIONS: --max-old-space-size=6144
+          TRONIDE_GITHUB_BFF_ORIGIN: ${{ vars.TRONIDE_GITHUB_BFF_ORIGIN }}
         run: bash build.sh
 
       # Pages serves a CNAME file as the custom domain. A push to main always

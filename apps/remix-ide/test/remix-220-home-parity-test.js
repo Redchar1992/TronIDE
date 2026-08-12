@@ -81,8 +81,8 @@ test('Remix 2.2.0 home parity records edge, security, accessibility, and blocked
   var landingSource = fs.readFileSync(landingSourcePath, 'utf8')
   var contractVerificationSource = fs.readFileSync(contractVerificationSourcePath, 'utf8')
 
-  t.ok(landingSource.indexOf('connectWithGithubOAuth') !== -1 && landingSource.indexOf('fine-grained GitHub token') !== -1, 'GitHub OAuth and token-mode boundaries are explicit')
-  t.ok(landingSource.indexOf('The token stays in this tab, survives refresh') !== -1 && landingSource.indexOf('never written to persistent browser storage') !== -1, 'account auth documents tab-scoped credential storage instead of a nonexistent remember mode')
+  t.ok(landingSource.indexOf('connectWithGithubOAuth') !== -1 && landingSource.indexOf('GitHub authorization is handled by the TronIDE BFF') !== -1, 'GitHub OAuth and the BFF credential boundary are explicit')
+  t.ok(landingSource.indexOf('never receives or stores the GitHub access token') !== -1, 'account auth documents the server-side GitHub credential boundary')
   t.equal(landingSource.indexOf('landingAiAudioButton'), -1, 'Home no longer exposes an AI audio placeholder hook')
   t.equal(landingSource.indexOf('landingAiModelSelector'), -1, 'Home no longer exposes an AI model selector placeholder hook')
   t.equal(landingSource.indexOf('landingAiHistoryButton'), -1, 'Home no longer exposes an AI history placeholder hook')

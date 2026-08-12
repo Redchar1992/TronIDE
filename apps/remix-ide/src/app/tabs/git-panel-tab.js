@@ -174,12 +174,11 @@ export class GitPanelTab extends ViewPlugin {
     }
   }
 
-  // True if the OAuth flow has a GitHub token in memory (lib/github-auth — never
-  // web storage). Push/Pull/private-clone need it; we only HINT the user toward
-  // the existing "Connect to GitHub" button rather than reimplementing auth here.
-  // After a full reload the token is gone, so this reads false until reconnect.
+  // True when this tab has an opaque BFF session. Push/Pull/private-clone need
+  // it; we only point users at the existing Connect GitHub flow rather than
+  // reimplementing authentication here.
   _hasGithubToken () {
-    try { return !!githubAuth.getToken() } catch (e) { return false }
+    try { return githubAuth.isConnected() } catch (e) { return false }
   }
 
   // The first remote's URL (origin if present), or '' if no remote configured.

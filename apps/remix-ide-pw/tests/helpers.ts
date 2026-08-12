@@ -24,6 +24,22 @@ export async function gotoHome (page: Page) {
   await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
 }
 
+/**
+ * Seed only TronIDE's opaque BFF session for deterministic UI tests. This is
+ * not a GitHub credential; no PAT or OAuth access token enters browser storage.
+ */
+export async function seedGithubBffSession (page: Page, login = 'tron-tester') {
+  await page.evaluate(({ user }) => {
+    window.sessionStorage.setItem('tronide.github.session', 'test_bff_session_handle_012345678901234567890')
+    window.sessionStorage.setItem('tronide.github.user', user)
+    window.sessionStorage.removeItem('tronide.github.token')
+    window.localStorage.removeItem('tronide.github.token')
+  }, { user: login })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await dismissWelcomeModal(page)
+  await page.locator('[data-id="landingWorkspaceStatus"]').waitFor({ timeout: 30_000 })
+}
+
 /** data-id selector for a row of the File Explorer tree. */
 export function treeItem (path: string) {
   return `[data-id="treeViewLitreeViewItem${path}"]`

@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  github-oauth-bff:
+    name: GitHub OAuth BFF checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
+        with:
+          deno-version: v2.4.2
+
+      - name: Check and test BFF
+        working-directory: services/github-oauth
+        run: |
+          deno task check
+          deno task test
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

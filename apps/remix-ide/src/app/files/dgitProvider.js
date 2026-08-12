@@ -29,6 +29,7 @@ import {
   saveAs
 } from 'file-saver'
 import * as githubAuth from '../../lib/github-auth'
+import { GITHUB_BFF } from '../../lib/github-bff'
 
 const JSZip = require('jszip')
 const path = require('path')
@@ -39,7 +40,7 @@ const axios = require('axios')
 // browser cannot reach github.com's git endpoints directly; isomorphic-git
 // routes every request through this proxy (our Deno OAuth service, which also
 // hosts the `/git/` forwarder). Change here if the Deno deployment URL changes.
-const GIT_CORS_PROXY = 'https://tronide-gh-oauth.redchar1992.deno.net/git'
+const GIT_CORS_PROXY = GITHUB_BFF.origin + '/git'
 
 // A trailing slash in a pasted repo URL (github.com/owner/repo/) survives into
 // the proxied path as '//', which the proxy's SSRF guard rejects — normalize
@@ -49,15 +50,26 @@ function normalizeGitUrl (url) {
   return String(url).trim().replace(/\/+$/, '')
 }
 
-// isomorphic-git auth callback. GitHub accepts the personal/OAuth token as the
-// HTTP-basic *username* with a fixed password. The token now lives only in
-// memory (lib/github-auth) — never in sessionStorage — so we read it from there.
-// If absent (e.g. after a full reload), fail loudly so the UI can point the user
-// at "Connect to GitHub" instead of hanging on a 401 loop.
+// Every operation proactively sends only TronIDE's opaque BFF session header,
+// so private GitHub discovery succeeds on the first request. Keep onAuth as a
+// retry callback in case isomorphic-git receives a 401 after a session refresh.
 function gitOnAuth () {
-  const token = githubAuth.getToken()
-  if (!token) throw new Error('Connect GitHub first (use the "Connect to GitHub" button).')
-  return { username: token, password: 'x-oauth-basic' }
+  const session = githubAuth.getSession()
+  if (!session) throw new Error('Connect GitHub first (use the "Connect to GitHub" button).')
+  return { headers: { 'X-TronIDE-Session': session } }
+}
+
+function gitOnAuthFailure () {
+  // A second 401 means the BFF session is no longer usable (the server also
+  // deletes it when GitHub rejects the upstream token). Remove the stale UI
+  // state instead of leaving GitHub displayed as connected.
+  githubAuth.clearSession()
+  return { cancel: true }
+}
+
+function gitSessionHeaders () {
+  const session = githubAuth.getSession()
+  return session ? { 'X-TronIDE-Session': session } : {}
 }
 
 // Pinata calls carry the pinata_secret_api_key in axios request headers. On
@@ -553,11 +565,13 @@ class DGitProvider extends Plugin {
         dir: gitCmd.dir || config.dir,
         http,
         corsProxy: GIT_CORS_PROXY,
+        headers: gitSessionHeaders(),
         url: normalizeGitUrl(gitCmd.url),
         ref: gitCmd.branch || undefined,
         singleBranch: gitCmd.singleBranch === true,
         depth: gitCmd.depth || 1,
-        onAuth: gitOnAuth
+        onAuth: gitOnAuth,
+        onAuthFailure: gitOnAuthFailure
       })
       await this.call('fileManager', 'refresh')
       this._emitGitChanged('clone')
@@ -573,12 +587,14 @@ class DGitProvider extends Plugin {
     try {
       const { config, gitCmd } = await this._mutationContext(cmd || {})
       const singleBranch = gitCmd.singleBranch === true || !!gitCmd.branch
+      const remote = gitCmd.remote || 'origin'
       const result = await git.fetch({
         ...config,
         http,
         corsProxy: GIT_CORS_PROXY,
+        headers: gitSessionHeaders(),
         url: normalizeGitUrl(gitCmd.url),
-        remote: gitCmd.remote || 'origin',
+        remote,
         // isomorphic-git tries to resolve the local HEAD when ref is omitted,
         // which fails for the exact Add-remote-on-an-unborn-repo flow. Remote
         // HEAD is a safe negotiation target while singleBranch=false still
@@ -588,7 +604,8 @@ class DGitProvider extends Plugin {
         // what makes Add remote / Fetch populate the complete branch picker.
         singleBranch,
         depth: gitCmd.depth || 1,
-        onAuth: gitOnAuth
+        onAuth: gitOnAuth,
+        onAuthFailure: gitOnAuthFailure
       })
       this._emitGitChanged('fetchRemote')
       return result
@@ -626,11 +643,13 @@ class DGitProvider extends Plugin {
         cache,
         http,
         corsProxy: GIT_CORS_PROXY,
+        headers: gitSessionHeaders(),
         url: normalizeGitUrl(gitCmd.url),
         remote,
         ref,
         singleBranch: true,
-        onAuth: gitOnAuth
+        onAuth: gitOnAuth,
+        onAuthFailure: gitOnAuthFailure
       })
 
       // Fetch is intentionally allowed to update remote-tracking refs, just
@@ -716,15 +735,18 @@ class DGitProvider extends Plugin {
     const mutationToken = this._beginGitMutation('pushing remote changes')
     try {
       const { config, gitCmd } = await this._mutationContext(cmd || {})
+      const remote = gitCmd.remote || 'origin'
       const result = await git.push({
         ...config,
         http,
         corsProxy: GIT_CORS_PROXY,
+        headers: gitSessionHeaders(),
         url: normalizeGitUrl(gitCmd.url),
-        remote: gitCmd.remote || 'origin',
+        remote,
         ref: gitCmd.branch || undefined,
         force: !!gitCmd.force,
-        onAuth: gitOnAuth
+        onAuth: gitOnAuth,
+        onAuthFailure: gitOnAuthFailure
       })
       if (result && result.ok === false) {
         const reason = (result.error) || (result.errors && result.errors.join('; ')) || 'push rejected'

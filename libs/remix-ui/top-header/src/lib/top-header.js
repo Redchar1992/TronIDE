@@ -182,12 +182,10 @@ export const TopHeader = ({ plugin, _deps }) => {
 
   useEffect(() => {
     // Reflect the GitHub connection (made on the Home panel) in the header
-    // button — mirrors the wallet header. The token lives in this tab's session
-    // (lib/github-auth); read it from there and subscribe to its onChange.
-    // setToken/clearToken also dispatch 'tronideGithubConnectionChanged', so we
-    // keep that listener (plus focus) for any consumer that relies on the event.
-    // A refresh rehydrates the tab-session token; closing the tab forgets it.
-    const readGithub = () => ({ connected: !!githubAuth.getToken(), login: githubAuth.getLogin() })
+    // button — mirrors the wallet header. Only an opaque BFF session handle
+    // lives in this tab; GitHub's access token remains encrypted server-side.
+    // Keep the existing event plus the direct store subscription in sync.
+    const readGithub = () => ({ connected: githubAuth.isConnected(), login: githubAuth.getLogin() })
     const refresh = () => setGithubState(readGithub())
     refresh()
     githubAuth.onChange(refresh)
@@ -296,7 +294,7 @@ export const TopHeader = ({ plugin, _deps }) => {
   const onGithubDisconnect = () => {
     disconnectGithub()
     setGithubMenuOpen(false)
-    // githubAuth.clearToken() (inside disconnectGithub) notifies our own
+    // githubAuth.clearSession() (inside disconnectGithub) notifies our own
     // subscriber, but set state here too so the label flips without waiting.
     setGithubState({ connected: false, login: '' })
   }
