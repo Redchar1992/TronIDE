@@ -64,7 +64,10 @@ export function connectWithGithubOAuth (opts = {}) {
       redirect_uri: GITHUB_OAUTH.redirectUri,
       scope: opts.scope || GITHUB_OAUTH.scope,
       state,
-      allow_signup: 'false'
+      allow_signup: 'false',
+      // Avoid silently reusing whichever GitHub account is active in the
+      // browser, especially on shared devices or with multiple sessions.
+      prompt: 'select_account'
     }).toString()
 
     const w = 720

@@ -36,6 +36,7 @@ test('URL imports, wallet events, OAuth messages, and AI staging keep their secu
   t.ok(filePanel.indexOf('normalizeUrlImport(params.url)') !== -1, '#url is allow-listed before contentImport.resolve')
   t.ok(wallet.indexOf('event.source !== window || event.origin !== window.location.origin') !== -1, 'wallet postMessage requires the same window and origin')
   t.ok(oauth.indexOf('event.source !== popup') !== -1, 'OAuth completion must come from the popup that was opened')
+  t.ok(oauth.indexOf("prompt: 'select_account'") !== -1, 'OAuth must let users choose the GitHub account explicitly')
   t.ok(chat.indexOf("title: 'AI wants to stage all workspace changes'") !== -1, 'git_stage_all asks for confirmation')
   t.ok(chat.indexOf("title: 'AI wants to stage workspace files'") !== -1, 'git_stage asks for confirmation')
   t.end()
