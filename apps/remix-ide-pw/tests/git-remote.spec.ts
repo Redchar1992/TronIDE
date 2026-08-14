@@ -90,8 +90,21 @@ test.describe('Git panel (remote)', () => {
     }
 
     let proxiedPushes = 0
+    const proxiedHeaders: Array<Record<string, string>> = []
     await page.route('**/git/**', (route) => {
+      const request = route.request()
+      if (request.method() === 'OPTIONS') {
+        return route.fulfill({
+          status: 204,
+          headers: {
+            'access-control-allow-origin': request.headers().origin || new URL(page.url()).origin,
+            'access-control-allow-methods': 'GET, POST, OPTIONS',
+            'access-control-allow-headers': request.headers()['access-control-request-headers'] || 'x-tronide-session'
+          }
+        })
+      }
       proxiedPushes++
+      proxiedHeaders.push(request.headers())
       return route.abort()
     })
     await page.locator('[data-id="gitAddRemoteUrl"]').fill('https://github.com/octocat/Hello-World.git')
@@ -100,6 +113,7 @@ test.describe('Git panel (remote)', () => {
     // Add remote now performs an all-ref fetch. This test intentionally aborts
     // that request to remain an offline @gate test; count only later pushes.
     proxiedPushes = 0
+    proxiedHeaders.length = 0
 
     // Approval is scoped to the branch that was visible in the modal. Switch
     // branches programmatically while it is open; confirming the stale modal
@@ -133,6 +147,8 @@ test.describe('Git panel (remote)', () => {
     await page.locator('[data-id="gitForcePush"]').click()
     await page.locator('#modal-footer-ok').click()
     await expect.poll(() => proxiedPushes, { timeout: 15_000 }).toBeGreaterThan(0)
+    expect(proxiedHeaders.every((headers) => headers['x-tronide-session'] === 'test_bff_session_handle_012345678901234567890')).toBe(true)
+    expect(proxiedHeaders.every((headers) => !headers.authorization)).toBe(true)
     await expect(page.locator('[data-id="gitStatus"]')).toContainText(/push failed/i, { timeout: 15_000 })
 
     // Ordinary Push remains direct: no destructive-action modal is introduced.

@@ -171,7 +171,7 @@ module.exports = config => {
     BROWSER: JSON.stringify(true),
     // Public team-owned Deno BFF origin. Keep overridable so test and
     // production can cut over independently without editing application code.
-    'process.env.TRONIDE_GITHUB_BFF_ORIGIN': JSON.stringify(process.env.TRONIDE_GITHUB_BFF_ORIGIN || 'https://tronide-gh-oauth.redchar1992.deno.net'),
+    'process.env.TRONIDE_GITHUB_BFF_ORIGIN': JSON.stringify(process.env.TRONIDE_GITHUB_BFF_ORIGIN || ''),
     'process.env.TRON_PUBLIC_TRONGRID_API_KEY': JSON.stringify(process.env.TRON_PUBLIC_TRONGRID_API_KEY || ''),
     'process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_MAINNET_CONTRACT_API_URLS || ''),
     'process.env.TRONSCAN_NILE_CONTRACT_API_URLS': JSON.stringify(process.env.TRONSCAN_NILE_CONTRACT_API_URLS || ''),

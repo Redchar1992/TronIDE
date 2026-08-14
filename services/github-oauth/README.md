@@ -27,7 +27,8 @@ Configure the team-owned OAuth App with:
 | Authorization callback URL | `<REDIRECT_URI>` ending in `/callback` |
 | Enable Device Flow         | off                                    |
 
-The OAuth App and the Deno project are separate resources. Transfer and verify
+The OAuth App and the Deno project are separate resources. Create or transfer
+the OAuth App and create the Deno project under the organization, then verify
 both; transferring the source repository alone changes neither one.
 
 ## 2. Deno deployment
@@ -41,7 +42,7 @@ deployctl deploy --project=tronide-gh-oauth main.ts
 ```
 
 A linked repository may deploy the same entry point automatically. The main
-TronIDE GitLab pipeline does not deploy this service.
+TronIDE frontend pipeline does not deploy this service.
 
 ## 3. Environment variables
 
@@ -91,7 +92,7 @@ OAuth.
 ```sh
 cd services/github-oauth
 deno task test
-deno check --unstable main.ts
+deno check main.ts
 ```
 
 For a full local OAuth flow, create a separate development OAuth App and set its

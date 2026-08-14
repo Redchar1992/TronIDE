@@ -9,12 +9,10 @@
 
 const CLIENT_ID = Deno.env.get("GITHUB_CLIENT_ID") ?? "";
 const CLIENT_SECRET = Deno.env.get("GITHUB_CLIENT_SECRET") ?? "";
-const REDIRECT_URI = Deno.env.get("REDIRECT_URI") ??
-  "https://tronide-gh-oauth.redchar1992.deno.net/callback";
+const REDIRECT_URI = Deno.env.get("REDIRECT_URI") ?? "";
 const SESSION_ENCRYPTION_KEY = Deno.env.get("SESSION_ENCRYPTION_KEY") ?? "";
-const ALLOWED_ORIGINS =
-  (Deno.env.get("ALLOWED_ORIGINS") ?? "https://tronide.io")
-    .split(",").map((value) => value.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = (Deno.env.get("ALLOWED_ORIGINS") ?? "")
+  .split(",").map((value) => value.trim()).filter(Boolean);
 const GITHUB_SCOPE = Deno.env.get("GITHUB_SCOPE") ?? "gist repo";
 const OAUTH_RATE_LIMIT = positiveInt(Deno.env.get("OAUTH_RATE_LIMIT"), 10);
 const API_RATE_LIMIT = positiveInt(Deno.env.get("API_RATE_LIMIT"), 120);

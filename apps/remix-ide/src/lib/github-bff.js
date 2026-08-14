@@ -9,12 +9,13 @@
 import * as githubAuth from './github-auth.js'
 
 export const GITHUB_BFF = {
-  origin: String(process.env.TRONIDE_GITHUB_BFF_ORIGIN || 'https://tronide-gh-oauth.redchar1992.deno.net').replace(/\/$/, ''),
+  origin: String(process.env.TRONIDE_GITHUB_BFF_ORIGIN || '').replace(/\/$/, ''),
   sessionHeader: 'X-TronIDE-Session'
 }
 
 function bffUrl (path) {
   const normalized = String(path || '')
+  if (!GITHUB_BFF.origin) throw new Error('GitHub BFF is not configured.')
   if (!normalized.startsWith('/')) throw new Error('GitHub BFF path must be absolute.')
   return GITHUB_BFF.origin + normalized
 }

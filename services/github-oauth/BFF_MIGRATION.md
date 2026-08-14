@@ -1,4 +1,4 @@
-# GitHub OAuth BFF migration plan (`release/v2.3.3`)
+# GitHub OAuth BFF migration plan
 
 ## Problem
 
@@ -65,13 +65,14 @@ sequenceDiagram
 
 ## Deployment and cut-over
 
-The GitLab frontend pipeline does **not** deploy `services/github-oauth`; Deno
-must be deployed separately. Do not point production at the BFF frontend until
-the service and secrets below are ready.
+The frontend pipelines do **not** deploy `services/github-oauth`; Deno must be
+deployed separately. Do not point production at the BFF frontend until the
+service and secrets below are ready.
 
-1. Complete ownership transfer of both the GitHub OAuth App and the Deno project
-   to the `tronweb3` team. Repository ownership alone does not transfer the Deno
-   project or its secrets.
+1. Create or transfer the GitHub OAuth App and create the Deno project under the
+   `tronweb3` organization. Verify both resources, their secrets, and deployment
+   access are organization-controlled. Repository ownership alone changes
+   neither resource.
 2. Attach Deno KV and configure:
    - `GITHUB_CLIENT_ID`
    - `GITHUB_CLIENT_SECRET`
@@ -84,7 +85,8 @@ the service and secrets below are ready.
    `prompt=select_account`.
 4. Update the GitHub OAuth App callback to the team-owned BFF `/callback`.
 5. Set the frontend build variable `TRONIDE_GITHUB_BFF_ORIGIN` to the same
-   team-owned BFF origin, then deploy `release/v2.3.3` to the test environment;
+   team-owned BFF origin, then deploy this branch/current online build to a
+   test or preview environment;
    run connect, refresh, gist, public/private repository import,
    commit/push/pull, disconnect, and expiry checks. Confirm DevTools never
    contains a GitHub access token.
@@ -104,5 +106,5 @@ rest of TronIDE.
 - REST and Git proxy path traversal, arbitrary hosts, redirects, and raw browser
   credentials are rejected.
 - Account selection is shown on every new OAuth connection.
-- Test-environment build SHA matches the pushed `release/v2.3.3` SHA and all
-  required GitLab jobs pass.
+- Test-environment build SHA matches the pushed PR SHA and all required GitHub
+  checks pass.

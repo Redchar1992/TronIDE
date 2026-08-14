@@ -57,6 +57,22 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate GitHub BFF configuration
+        env:
+          TRONIDE_GITHUB_BFF_ORIGIN: ${{ vars.TRONIDE_GITHUB_BFF_ORIGIN }}
+        run: |
+          if [ -z "$TRONIDE_GITHUB_BFF_ORIGIN" ]; then
+            echo "::error::Set the TRONIDE_GITHUB_BFF_ORIGIN repository variable before deploying."
+            exit 1
+          fi
+          case "$TRONIDE_GITHUB_BFF_ORIGIN" in
+            https://*) ;;
+            *)
+              echo "::error::TRONIDE_GITHUB_BFF_ORIGIN must be an HTTPS origin."
+              exit 1
+              ;;
+          esac
+
       # build.sh runs the production nx build (baseHref "./", path-agnostic) and
       # normalises index.html. Output: build/apps/remix-ide.
       - name: Build

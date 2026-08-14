@@ -20,6 +20,7 @@
 'use strict'
 
 var test = require('tape')
+process.env.TRONIDE_GITHUB_BFF_ORIGIN = 'https://tronide-github-bff.test'
 var GistHandler = require('../src/lib/gist-handler')
 var githubAuth = require('../src/lib/github-auth')
 
@@ -211,7 +212,7 @@ test('GistHandler.loadFromGist does not send Authorization on raw_url fetches (C
       var readHeader = function (name) {
         return headers && typeof headers.get === 'function' ? headers.get(name) : headers[name]
       }
-      if (u.indexOf('tronide-gh-oauth.redchar1992.deno.net/api/gists/') !== -1) {
+      if (u.indexOf('tronide-github-bff.test/api/gists/') !== -1) {
         apiSession = readHeader('X-TronIDE-Session')
         var payload = JSON.stringify({
           id: GID,
