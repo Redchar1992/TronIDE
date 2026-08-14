@@ -57,11 +57,9 @@ const profile = {
   events: [],
   icon,
   description: 'Local Git version control for the current workspace.',
-  // 'fileexplorer' groups the icon with the workspace tools; vertical-icons
-  // only has a fixed set of kind buckets (no 'git' section) and would throw
-  // on appendChild for an unknown kind.
+  // Keep the implementation registered while temporarily suppressing its UI entry.
   kind: 'fileexplorer',
-  location: 'sidePanel',
+  location: 'hiddenPanel',
   documentation: 'https://developers.tron.network/docs/tron-ide',
   version: packageJson.version
 }

@@ -244,7 +244,8 @@ class PluginManagerComponent extends ViewPlugin {
     const isFiltered = (profile) => (profile.displayName ? profile.displayName : profile.name).toLowerCase().includes(this.filter)
     const isNotRequired = (profile) => !this.appManager.isRequired(profile.name)
     const isNotDependent = (profile) => !this.appManager.isDependent(profile.name)
-    const isNotHome = (profile) => profile.name !== 'home'
+    // Temporarily keep the Git integration out of the plugin manager UI.
+    const isVisibleInManager = (profile) => !['home', 'gitPanel'].includes(profile.name)
     const sortByName = (profileA, profileB) => {
       const nameA = ((profileA.displayName) ? profileA.displayName : profileA.name).toUpperCase()
       const nameB = ((profileB.displayName) ? profileB.displayName : profileB.name).toUpperCase()
@@ -256,7 +257,7 @@ class PluginManagerComponent extends ViewPlugin {
       .filter(isFiltered)
       .filter(isNotRequired)
       .filter(isNotDependent)
-      .filter(isNotHome)
+      .filter(isVisibleInManager)
       .sort(sortByName)
       .reduce(({ actives, inactives }, profile) => {
         return this.isActive(profile.name)

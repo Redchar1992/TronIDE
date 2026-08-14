@@ -1054,7 +1054,7 @@ export const TopHeader = ({ plugin, _deps }) => {
           </Tooltip>
         </div>
         <div className='header-actions'>
-          <div className='header-github-action' ref={githubMenuRef}>
+          <div className='header-github-action' ref={githubMenuRef} hidden>
             <button
               className='header-action-btn'
               data-id='headerGithubConnect'

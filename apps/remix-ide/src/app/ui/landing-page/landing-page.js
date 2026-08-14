@@ -2047,7 +2047,7 @@ export class LandingPage extends ViewPlugin {
     }
 
     const renderGithubTokenPanel = () => yo`
-      <section class=${css.panel} data-id="landingGithubTokenPanel">
+      <section class=${css.panel} data-id="landingGithubTokenPanel" hidden>
         <div class=${css.panelHead}>
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>${githubIcon}</span> GitHub Token</h3>
           <span class=${css.panelMore} title=${githubTokenState.user && githubTokenState.user.login ? `Connected as ${githubTokenState.user.login}` : 'No token set yet. Tokens are kept for this browser session only (not saved to disk).'}>${githubTokenState.user && githubTokenState.user.login ? githubTokenState.user.login : 'Not connected'}</span>
@@ -2111,7 +2111,7 @@ export class LandingPage extends ViewPlugin {
     `
 
     const renderGitWorkflowPanel = () => yo`
-      <section class=${css.panel} data-id="landingGitWorkflowPanel">
+      <section class=${css.panel} data-id="landingGitWorkflowPanel" hidden>
         <div class=${css.panelHead}>
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>🔀</span> Git Workflow</h3>
           <span class=${css.panelMore}>Beta</span>
@@ -2130,7 +2130,7 @@ export class LandingPage extends ViewPlugin {
           <h3 class=${css.panelHeadTitle}><span class=${css.panelHeadIcon}>⋯</span> Advanced tools</h3>
           <button class=${css.loadChip} data-id="landingAdvancedToolsToggle" onclick=${() => toggleAdvancedTools()} aria-expanded=${advancedToolsState.open ? 'true' : 'false'}>${advancedToolsState.open ? 'Hide' : 'Show'} tools</button>
         </div>
-        <div class=${css.fileDesc}>Verification, GitHub token flow, layout controls, workspace health, and TRON recipes are available here when needed.</div>
+        <div class=${css.fileDesc}>Verification, layout controls, workspace health, and TRON recipes are available here when needed.</div>
         ${advancedToolsState.open ? yo`
           <div class=${css.advancedToolsGrid} data-id="landingAdvancedToolsContent">
             ${renderVerificationPanel()}
