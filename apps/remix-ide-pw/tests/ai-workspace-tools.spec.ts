@@ -571,8 +571,8 @@ test.describe('AI workspace tools — phase A (analysis / git / debug)', () => {
     expect(pageErrors).toEqual([])
   })
 
-  // TC-AI-TOOL-006: the full phase-A toolset is advertised to the model.
-  test('TC-AI-TOOL-006: analysis/git/debug tools are offered to the model', { tag: '@gate' }, async ({ page }) => {
+  // TC-AI-TOOL-006: Git tools stay implemented but are not advertised while the Git UI is hidden.
+  test('TC-AI-TOOL-006: analysis/debug tools are offered without Git tools', { tag: '@gate' }, async ({ page }) => {
     let toolNames: string[] = []
     await page.route(GW + '/**', async (route) => {
       const req = route.request()
@@ -585,9 +585,10 @@ test.describe('AI workspace tools — phase A (analysis / git / debug)', () => {
     await setKeyAndGateway(page)
     await ask(page, 'hi')
     await expect(page.getByText('READY').first()).toBeVisible({ timeout: 20_000 })
-    for (const t of ['run_static_analysis', 'run_tests', 'git_status', 'git_log', 'git_stage_all', 'git_stage', 'git_commit', 'git_create_branch', 'git_checkout', 'git_push', 'git_pull', 'git_clone', 'list_workspaces', 'create_workspace', 'switch_workspace', 'debug_transaction', 'delete_file', 'rename_file']) {
+    for (const t of ['run_static_analysis', 'run_tests', 'list_workspaces', 'create_workspace', 'switch_workspace', 'debug_transaction', 'delete_file', 'rename_file']) {
       expect(toolNames, `tool ${t} must be advertised`).toContain(t)
     }
+    expect(toolNames.some((name) => name.startsWith('git_')), 'Git tools must not be advertised').toBe(false)
   })
 
   // TC-AI-TOOL-007: delete_file removes a workspace file after the user confirms.

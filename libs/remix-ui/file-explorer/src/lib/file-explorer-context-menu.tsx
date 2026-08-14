@@ -137,6 +137,7 @@ export const FileExplorerContextMenu = (
 
   const menu = () => {
     return actions
+      .filter(({ id }) => !['pushChangesToGist', 'publishFolderToGist', 'publishFileToGist'].includes(id))
       .filter((item) => filterItem(item))
       .map((item, index) => {
         return (

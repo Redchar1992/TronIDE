@@ -45,16 +45,9 @@ test.describe('Home TRON Cookbook recipes', () => {
     await expect(toast(page)).toHaveCount(1)
   })
 
-  // TC-CB-003: GitHub token safety gives visible feedback (a toast) — success
-  // used to only add a silent bell notification, and the async clipboard
-  // rejection was never caught, so the click looked like a no-op.
-  test('TC-CB-003: GitHub token safety shows a visible toast', { tag: '@gate' }, async ({ page }) => {
-    const errors: string[] = []
-    page.on('pageerror', (e) => errors.push(String(e)))
+  // TC-CB-003: keep the implementation available while its entry point is temporarily hidden.
+  test('TC-CB-003: GitHub token safety recipe is hidden', { tag: '@gate' }, async ({ page }) => {
     await openHomeCookbook(page)
-    await page.locator('[data-id="landingRecipeGithubToken"]').click()
-    // either the "copied" confirmation or the checklist fallback — a toast shows
-    await expect(toast(page).filter({ hasText: /checklist|copied|GitHub token/i }).first()).toBeVisible({ timeout: 10_000 })
-    expect(errors).toEqual([])
+    await expect(page.locator('[data-id="landingRecipeGithubToken"]')).toHaveCount(0)
   })
 })

@@ -2035,7 +2035,7 @@ export class LandingPage extends ViewPlugin {
             <span class=${css.panelMore}>Static recipes</span>
           </div>
           <div class=${css.recipeGrid}>
-            ${recipes.map((recipe) => yo`
+            ${recipes.filter((recipe) => recipe[3] !== 'landingRecipeGithubToken').map((recipe) => yo`
               <button class=${css.recipeCard} data-id=${recipe[3]} onclick=${() => { try { const r = recipe[2](); if (r && r.catch) r.catch((e) => console.warn('[home] recipe failed:', e)) } catch (e) { console.warn('[home] recipe failed:', e) } }}>
                 <div class=${css.recipeTitle}>${recipe[0]}</div>
                 <div>${recipe[1]}</div>
