@@ -492,7 +492,7 @@ export const Workspace = (props: WorkspaceProps) => {
                     name={state.currentWorkspace}
                     registry={props.registry}
                     filesProvider={props.workspace}
-                    menuItems={['createNewFile', 'createNewFolder', 'publishToGist', canUpload ? 'uploadFile' : '']}
+                    menuItems={['createNewFile', 'createNewFolder', canUpload ? 'uploadFile' : '']}
                     plugin={props.plugin}
                     focusRoot={state.reset}
                     contextMenuItems={props.registeredMenuItems}
