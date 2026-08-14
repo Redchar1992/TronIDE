@@ -171,6 +171,8 @@ export const anthropicAIHandle = async ({ apiKey, model, stream, userContent, ba
 // Anthropic tool-use protocol. v1 is Anthropic-vendor only and non-streaming —
 // a tool round-trip needs complete messages anyway.
 
+const gitToolsEnabled = false
+
 export const AI_WORKSPACE_TOOLS = [
   {
     name: 'read_current_file',
@@ -561,7 +563,7 @@ export const AI_WORKSPACE_TOOLS = [
       }
     }
   }
-]
+].filter(({ name }) => gitToolsEnabled || !name.startsWith('git_'))
 
 const workspaceToolsNote = `
 You can operate the user's IDE workspace with the provided tools:
@@ -607,7 +609,7 @@ You can operate the user's IDE workspace with the provided tools:
 - run_tests: run the workspace Solidity unit tests (_test.sol files, remix_tests assertions) and report
   passing/failing counts plus the failing assertions. Omit path for the whole "tests" folder, or pass a
   single _test.sol file / folder. Use it for "run the tests" or to confirm a change didn't break them.
-- git_status / git_log: read the local repo state and recent commits.
+${gitToolsEnabled ? `- git_status / git_log: read the local repo state and recent commits.
 - git_diff: see the actual line-level changes (working tree vs HEAD), optionally for one file. Run it
   before writing a commit message or when the user asks what changed — git_status only names files.
 - git_stage_all / git_stage / git_commit / git_create_branch / git_checkout: local version control.
@@ -620,7 +622,7 @@ You can operate the user's IDE workspace with the provided tools:
   tree. If they fail with "add a remote", the user has not connected GitHub / added a remote yet.
 - git_clone: clone an https repo into a NEW workspace and switch to it (the current workspace is left
   intact). Confirmed by the user. Use it for "clone this repo and …"; public repos need no auth,
-  private repos need "Connect to GitHub" first.
+  private repos need "Connect to GitHub" first.` : ''}
 - debug_transaction: open the Debugger on a tx hash and summarize the trace. Use it for "debug"/"why did
   this tx fail/revert".
 - list_accounts / get_balance: list the environment's accounts with TRX balances, or read one address's
