@@ -118,6 +118,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build remix-solidity
+        run: pnpm nx build remix-solidity --skip-nx-cache
+
       - name: Test Remix IDE
         run: node apps/remix-ide/test/index.js
 
@@ -132,9 +135,6 @@ jobs:
 
       - name: Test remix-analyzer
         run: pnpm nx test remix-analyzer --skip-nx-cache
-
-      - name: Build remix-solidity
-        run: pnpm nx build remix-solidity --skip-nx-cache
 
   tronbox-handoff:
     name: Required TronBox handoff compatibility

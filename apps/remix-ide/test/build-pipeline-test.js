@@ -163,3 +163,17 @@ test('GitHub Actions references are immutable commit pins', function (t) {
   })
   t.end()
 })
+
+test('GitHub unit tests build remix-solidity before loading compiled app tests', function (t) {
+  var workflow = readRoot('.github/workflows/ci.yml')
+  var unitJob = (workflow.match(/\n  unit:[\s\S]*?\n  tronbox-handoff:/) || [])[0] || ''
+  var buildIndex = unitJob.indexOf('- name: Build remix-solidity')
+  var ideTestIndex = unitJob.indexOf('- name: Test Remix IDE')
+
+  t.ok(unitJob, 'the required unit job is present')
+  t.ok(buildIndex !== -1, 'the unit job builds remix-solidity')
+  t.ok(ideTestIndex !== -1, 'the unit job runs the Remix IDE tests')
+  t.ok(buildIndex < ideTestIndex, 'compiled remix-solidity output exists before the Remix IDE tests load it')
+  t.equal((unitJob.match(/- name: Build remix-solidity/g) || []).length, 1, 'the library is built exactly once in the unit job')
+  t.end()
+})
