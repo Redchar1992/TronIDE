@@ -227,6 +227,7 @@ jobs:
       - name: Run deterministic Playwright gate
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          TRONIDE_GITHUB_BFF_ORIGIN: https://tronide-github-bff.test
         run: pnpm test:pw:gate
 
   e2e-remixd-gate:

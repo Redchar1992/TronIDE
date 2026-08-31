@@ -37,6 +37,7 @@ test('GitHub CI separates the required Playwright gate from the full regression'
   t.ok(gate.includes('name: Required Playwright release gate'), 'the focused release gate is a distinct required job')
   t.ok(gate.includes('timeout-minutes: 45'), 'the gate has enough runner time for the serial browser suite')
   t.ok(gate.includes('run: pnpm test:pw:gate'), 'the required job runs only the deterministic @gate subset')
+  t.ok(gate.includes('TRONIDE_GITHUB_BFF_ORIGIN: https://tronide-github-bff.test'), 'the gate compiles GitHub flows against a routeable synthetic BFF origin')
   t.notOk(gate.includes('continue-on-error: true'), 'the focused release gate cannot fail silently')
   t.ok(remixdGate.includes('name: Required real remixd integration gate'), 'real remixd has a separate required CI job')
   t.ok(remixdGate.includes('run: pnpm e2e:remixd'), 'the required remixd job runs the daemon-backed suite')
