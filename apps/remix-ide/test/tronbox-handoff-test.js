@@ -187,13 +187,17 @@ test('TronBox handoff gate performs syntax and migration dry validation without 
 
 test('CI runs the fixed-version TronBox compatibility gate as blocking work', function (t) {
   var github = fs.readFileSync(path.join(root, '.github/workflows/ci.yml'), 'utf8')
-  var gitlab = fs.readFileSync(path.join(root, '.gitlab-ci.yml'), 'utf8')
-  var gitlabCoreRunner = fs.readFileSync(path.join(root, 'scripts/run-core-tests-ci.sh'), 'utf8')
   var packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 
   t.equal(packageJson.scripts['test:tronbox-handoff'], 'node scripts/validate-tronbox-handoff.cjs', 'package script exposes the same local/CI gate')
   t.ok(github.includes('tronbox-handoff:') && github.includes('pnpm test:tronbox-handoff'), 'GitHub CI has a required compatibility job')
-  t.ok(gitlabCoreRunner.includes('TRONBOX_HANDOFF_SKIP_COMPILE=1') && gitlab.includes('pnpm test:tronbox-handoff'), 'GitLab runs the offline handoff contract in the fast gate and the real compile in full review')
+  if (fs.existsSync(path.join(root, '.gitlab-ci.yml'))) {
+    var gitlab = fs.readFileSync(path.join(root, '.gitlab-ci.yml'), 'utf8')
+    var gitlabCoreRunner = fs.readFileSync(path.join(root, 'scripts/run-core-tests-ci.sh'), 'utf8')
+    t.ok(gitlabCoreRunner.includes('TRONBOX_HANDOFF_SKIP_COMPILE=1') && gitlab.includes('pnpm test:tronbox-handoff'), 'GitLab runs the offline handoff contract in the fast gate and the real compile in full review')
+  } else {
+    t.comment('GitLab TronBox assertions skipped in the public mirror')
+  }
   t.notOk(github.includes('tronbox-handoff:\n    continue-on-error: true'), 'compatibility job is not allowed to fail')
   t.end()
 })

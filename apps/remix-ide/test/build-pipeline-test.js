@@ -20,7 +20,21 @@ function readRoot (relativePath) {
   return fs.readFileSync(path.join(root, relativePath), 'utf8')
 }
 
-test('release archives use the intended development suffix', function (t) {
+function testWithFiles (name, relativePaths, callback) {
+  test(name, function (t) {
+    var missing = relativePaths.filter(function (relativePath) {
+      return !fs.existsSync(path.join(root, relativePath))
+    })
+    if (missing.length > 0) {
+      t.comment('skipped because this public mirror excludes: ' + missing.join(', '))
+      t.end()
+      return
+    }
+    callback(t)
+  })
+}
+
+testWithFiles('release archives use the intended development suffix', ['.gitlab-ci-base.yml', 'scripts/publish.sh'], function (t) {
   var ci = readRoot('.gitlab-ci-base.yml')
   var publish = readRoot('scripts/publish.sh')
 
@@ -32,7 +46,7 @@ test('release archives use the intended development suffix', function (t) {
   t.end()
 })
 
-test('all release jobs use one fixed short SHA', function (t) {
+testWithFiles('all release jobs use one fixed short SHA', ['.gitlab-ci-base.yml'], function (t) {
   var ci = readRoot('.gitlab-ci-base.yml')
   var fixedSha = 'short_sha="${CI_COMMIT_SHORT_SHA:-$(git rev-parse --short=8 HEAD)}"'
 
@@ -41,7 +55,7 @@ test('all release jobs use one fixed short SHA', function (t) {
   t.end()
 })
 
-test('deployment scripts use strict Bash entrypoints', function (t) {
+testWithFiles('deployment scripts use strict Bash entrypoints', ['scripts/deploy.sh', 'scripts/publish.sh', 'scripts/fetch.sh'], function (t) {
   ;['scripts/deploy.sh', 'scripts/publish.sh', 'scripts/fetch.sh'].forEach(function (relativePath) {
     var source = readRoot(relativePath)
     t.ok(source.indexOf('#!/usr/bin/env bash') === 0, relativePath + ' has a portable Bash shebang')
@@ -50,7 +64,7 @@ test('deployment scripts use strict Bash entrypoints', function (t) {
   t.end()
 })
 
-test('publish only requires commands used by the test runner', function (t) {
+testWithFiles('publish only requires commands used by the test runner', ['scripts/publish.sh'], function (t) {
   var publish = readRoot('scripts/publish.sh')
 
   t.notOk(/for command_name in [^\n]*python3/.test(publish), 'publish does not require the unavailable python3 command')
@@ -58,7 +72,7 @@ test('publish only requires commands used by the test runner', function (t) {
   t.end()
 })
 
-test('test deployment has an explicit unsigned-signing fallback', function (t) {
+testWithFiles('test deployment has an explicit unsigned-signing fallback', ['.gitlab-ci.yml', 'scripts/deploy.sh'], function (t) {
   var ci = readRoot('.gitlab-ci.yml')
   var deploy = readRoot('scripts/deploy.sh')
 
@@ -73,7 +87,7 @@ test('test deployment has an explicit unsigned-signing fallback', function (t) {
   t.end()
 })
 
-test('MD5 manifest verification fails on tampering', function (t) {
+testWithFiles('MD5 manifest verification fails on tampering', ['scripts/md5_verify.py'], function (t) {
   var directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tronide-md5-'))
   var payload = path.join(directory, 'payload.txt')
   var manifest = path.join(directory, 'md5sums.txt')
@@ -104,21 +118,25 @@ test('compiler download and build metadata are pinned', function (t) {
 })
 
 test('GitHub OAuth BFF is release-gated and its origin reaches production builds', function (t) {
-  var gitlab = readRoot('.gitlab-ci.yml')
-  var gitlabBase = readRoot('.gitlab-ci-base.yml')
   var githubCi = readRoot('.github/workflows/ci.yml')
 
-  t.ok(/github_oauth_bff_test:[\s\S]*?task check[\s\S]*?task test/.test(gitlab), 'GitLab checks and tests the Deno BFF')
-  t.ok(gitlab.indexOf('denoland/deno:2.4.2@sha256:') !== -1, 'GitLab pins the Deno test image by digest')
-  t.ok(gitlabBase.indexOf('-e TRONIDE_GITHUB_BFF_ORIGIN=') !== -1, 'GitLab forwards the selected BFF base URL into the frontend build container')
-  t.ok(gitlabBase.indexOf('TRONIDE_GITHUB_BFF_ORIGIN must be configured') !== -1, 'GitLab refuses to build deployable artifacts without the organization BFF base URL')
-  t.notOk(/TRONIDE_GITHUB_BFF_ORIGIN:-https?:/.test(gitlabBase), 'GitLab has no hard-coded BFF deployment fallback')
-  t.notOk(/redchar1992/i.test(gitlabBase), 'GitLab has no personal BFF deployment reference')
   t.ok(/github-oauth-bff:[\s\S]*?deno task check[\s\S]*?deno task test/.test(githubCi), 'GitHub CI checks and tests the Deno BFF')
+  if (fs.existsSync(path.join(root, '.gitlab-ci.yml')) && fs.existsSync(path.join(root, '.gitlab-ci-base.yml'))) {
+    var gitlab = readRoot('.gitlab-ci.yml')
+    var gitlabBase = readRoot('.gitlab-ci-base.yml')
+    t.ok(/github_oauth_bff_test:[\s\S]*?task check[\s\S]*?task test/.test(gitlab), 'GitLab checks and tests the Deno BFF')
+    t.ok(gitlab.indexOf('denoland/deno:2.4.2@sha256:') !== -1, 'GitLab pins the Deno test image by digest')
+    t.ok(gitlabBase.indexOf('-e TRONIDE_GITHUB_BFF_ORIGIN=') !== -1, 'GitLab forwards the selected BFF base URL into the frontend build container')
+    t.ok(gitlabBase.indexOf('TRONIDE_GITHUB_BFF_ORIGIN must be configured') !== -1, 'GitLab refuses to build deployable artifacts without the organization BFF base URL')
+    t.notOk(/TRONIDE_GITHUB_BFF_ORIGIN:-https?:/.test(gitlabBase), 'GitLab has no hard-coded BFF deployment fallback')
+    t.notOk(/redchar1992/i.test(gitlabBase), 'GitLab has no personal BFF deployment reference')
+  } else {
+    t.comment('GitLab BFF assertions skipped in the public mirror')
+  }
   t.end()
 })
 
-test('production validation pins the complete NVM installer digest', function (t) {
+testWithFiles('production validation pins the complete NVM installer digest', ['.gitlab-ci.yml'], function (t) {
   var gitlab = readRoot('.gitlab-ci.yml')
   var digest = gitlab.match(/NVM_INSTALLER_SHA256='([0-9a-f]+)'/)
 
@@ -132,7 +150,6 @@ test('production validation pins the complete NVM installer digest', function (t
 test('dependency security pins and workspace bootstrap are explicit', function (t) {
   var packageJson = JSON.parse(readRoot('package.json'))
   var workflow = readRoot('.github/workflows/ci.yml')
-  var gitlab = readRoot('.gitlab-ci.yml')
   var yoYo = packageJson.devDependencies['yo-yo']
 
   t.equal(packageJson.scripts.postinstall, undefined, 'dependency installation has no implicit workspace build/download lifecycle')
@@ -145,11 +162,16 @@ test('dependency security pins and workspace bootstrap are explicit', function (
   t.notOk(/#(?:master|main|HEAD)$/.test(yoYo), 'yo-yo does not use a floating branch')
   t.ok(/- name: Audit dependencies\s+run: pnpm audit/.test(workflow), 'CI runs a blocking full dependency audit')
   t.notOk(/continue-on-error:\s*true\s+run: pnpm audit/.test(workflow), 'dependency audit failures are not ignored')
-  t.ok(/dependency_check:\s*\n\s+stage:\s+dependency_check/.test(gitlab), 'GitLab has a dedicated dependency-check stage')
-  t.ok(/dependency_check:[\s\S]*?pnpm install --frozen-lockfile --ignore-scripts/.test(gitlab), 'GitLab dependency check installs without lifecycle scripts')
-  t.ok(/dependency_check:[\s\S]*?pnpm audit --audit-level=low/.test(gitlab), 'GitLab dependency check runs the full blocking audit')
-  t.ok(/dependency_check:[\s\S]*?allow_failure:\s*false/.test(gitlab), 'GitLab dependency check failures are not ignored')
-  t.ok(/dependency_check:[\s\S]*?CI_COMMIT_BRANCH =~ \/\^release\\\/\.\*\$\//.test(gitlab), 'GitLab dependency check runs on release branches')
+  if (fs.existsSync(path.join(root, '.gitlab-ci.yml'))) {
+    var gitlab = readRoot('.gitlab-ci.yml')
+    t.ok(/dependency_check:\s*\n\s+stage:\s+dependency_check/.test(gitlab), 'GitLab has a dedicated dependency-check stage')
+    t.ok(/dependency_check:[\s\S]*?pnpm install --frozen-lockfile --ignore-scripts/.test(gitlab), 'GitLab dependency check installs without lifecycle scripts')
+    t.ok(/dependency_check:[\s\S]*?pnpm audit --audit-level=low/.test(gitlab), 'GitLab dependency check runs the full blocking audit')
+    t.ok(/dependency_check:[\s\S]*?allow_failure:\s*false/.test(gitlab), 'GitLab dependency check failures are not ignored')
+    t.ok(/dependency_check:[\s\S]*?CI_COMMIT_BRANCH =~ \/\^release\\\/\.\*\$\//.test(gitlab), 'GitLab dependency check runs on release branches')
+  } else {
+    t.comment('GitLab dependency assertions skipped in the public mirror')
+  }
   t.end()
 })
 
