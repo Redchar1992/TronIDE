@@ -5,6 +5,19 @@
 
 'use strict'
 
+const DEEP_LINK_LIMITS = Object.freeze({
+  code: Object.freeze({
+    maxParameterChars: 64 * 1024,
+    maxDecodedBytes: 32 * 1024,
+    tooLargeMessage: 'The contract source link is too large. Deep links accept up to 32 KiB of decoded source and a 64 KiB code parameter. Import the contract from GitHub or GitHub Gist instead.'
+  }),
+  remaps: Object.freeze({
+    maxParameterChars: 16 * 1024,
+    maxDecodedBytes: 8 * 1024,
+    tooLargeMessage: 'The remappings link is too large. Deep links accept up to 8 KiB of decoded remappings and a 16 KiB remaps parameter. Keep only the required mappings or import the project from GitHub or GitHub Gist instead.'
+  })
+})
+
 function decodeBase64Utf8 (payload) {
   if (typeof payload !== 'string' || payload.length === 0) {
     throw new Error('The encoded Base64 payload is empty.')
@@ -39,11 +52,17 @@ function encodeBase64Utf8 (value) {
  * decode exactly once without corrupting encoded separators such as `%26`.
  *
  * @param {string} payload Base64 text from a URL parameter
+ * @param {{maxParameterChars?: number, maxDecodedBytes?: number, tooLargeMessage?: string}} [limits]
  * @returns {string} decoded UTF-8 text
  */
-function decodeUrlBase64 (payload) {
+function decodeUrlBase64 (payload, limits) {
   if (typeof payload !== 'string' || payload.length === 0) {
     throw new Error('The encoded URL payload is empty.')
+  }
+
+  limits = limits || {}
+  if (limits.maxParameterChars && payload.length > limits.maxParameterChars) {
+    throw new Error(limits.tooLargeMessage || 'The encoded URL payload is too large.')
   }
 
   let encoded
@@ -53,11 +72,17 @@ function decodeUrlBase64 (payload) {
     throw new Error('The URL payload contains invalid percent encoding.')
   }
 
+  let decoded
   try {
-    return decodeBase64Utf8(encoded)
+    decoded = decodeBase64Utf8(encoded)
   } catch (error) {
     throw new Error('The URL payload is not valid Base64.')
   }
+
+  if (limits.maxDecodedBytes && new TextEncoder().encode(decoded).byteLength > limits.maxDecodedBytes) {
+    throw new Error(limits.tooLargeMessage || 'The decoded URL payload is too large.')
+  }
+  return decoded
 }
 
-module.exports = { decodeBase64Utf8, decodeUrlBase64, encodeBase64Utf8 }
+module.exports = { DEEP_LINK_LIMITS, decodeBase64Utf8, decodeUrlBase64, encodeBase64Utf8 }

@@ -87,4 +87,16 @@ test.describe('External-tool deep links', () => {
     await expect.poll(() => getEditorText(page), { timeout: 15_000 }).toBe(source)
     expect(requests).toBe(1)
   })
+
+  test('TC-DL-004 @gate: oversized embedded source is rejected with import guidance', async ({ page }) => {
+    const source = 'a'.repeat((32 * 1024) + 1)
+
+    await page.goto(`/#code=${encodePayload(source)}`, { waitUntil: 'domcontentloaded' })
+    await dismissWelcomeModal(page)
+
+    await expect(page.locator('#modal-title-h6')).toHaveText('Unable to import source', { timeout: 15_000 })
+    await expect(page.locator('#modal-body-id')).toContainText('Deep links accept up to 32 KiB of decoded source')
+    await expect(page.locator('#modal-body-id')).toContainText('Import the contract from GitHub or GitHub Gist instead')
+    await expect(page.locator('#workspacesSelect option[value="code-sample"]')).toHaveCount(0)
+  })
 })
