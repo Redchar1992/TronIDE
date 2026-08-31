@@ -78,16 +78,17 @@ export function encodeParams (params, funAbi, callback) {
     if (funArgs.length > 0) {
       try {
         data = encodeParamsHelper(funAbi, funArgs)
-        dataHex = data.toString()
+        const encodedData = data.toString()
+        dataHex = encodedData
+        if (encodedData.slice(0, 9) === 'undefined') {
+          dataHex = encodedData.slice(9)
+        }
+        if (encodedData.slice(0, 2) === '0x') {
+          dataHex = encodedData.slice(2)
+        }
       } catch (e) {
         return callback('Error encoding arguments: ' + e)
       }
-    }
-    if (data.slice(0, 9) === 'undefined') {
-      dataHex = data.slice(9)
-    }
-    if (data.slice(0, 2) === '0x') {
-      dataHex = data.slice(2)
     }
   }
   callback(null, { data: data, dataHex: dataHex, funArgs: funArgs })
@@ -210,15 +211,16 @@ export function buildData (contractName, contract, contracts, isConstructor, fun
     }
     try {
       data = encodeParamsHelper(funAbi, funArgs)
-      dataHex = data.toString()
+      const encodedData = data.toString()
+      dataHex = encodedData
+      if (encodedData.slice(0, 9) === 'undefined') {
+        dataHex = encodedData.slice(9)
+      }
+      if (encodedData.slice(0, 2) === '0x') {
+        dataHex = encodedData.slice(2)
+      }
     } catch (e) {
       return callback('Error encoding arguments: ' + e)
-    }
-    if (data.slice(0, 9) === 'undefined') {
-      dataHex = data.slice(9)
-    }
-    if (data.slice(0, 2) === '0x') {
-      dataHex = data.slice(2)
     }
   }
   let contractBytecode
