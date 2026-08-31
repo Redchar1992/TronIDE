@@ -343,10 +343,12 @@ export function deployLibrary (libraryName, libraryShortName, library, contracts
     const data = { dataHex: bytecode, funAbi: { type: 'constructor' }, funArgs: [], contractBytecode: bytecode, contractName: libraryShortName, contractABI: library.abi }
     callbackDeployLibrary({ data: data, useCall: false }, (err, txResult) => {
       if (err) {
+        callbackStep(`creation of library ${libraryName} errored: ${err.message || err}`)
         return callback(err)
       }
       const address = txResult.receipt.contractAddress
       library.address = address
+      callbackStep(`creation of library ${libraryName} succeeded.`)
       callback(err, address)
     })
   }
